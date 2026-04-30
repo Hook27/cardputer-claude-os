@@ -41,7 +41,8 @@ Done. Power the device on/off with the side switch.
 
 1. Power on the Cardputer
 2. Pick **Claude Buddy** from the launcher menu
-3. In Claude (desktop app): Developer menu → **Hardware Buddy** → Connect
+3. In Claude Desktop: **Help → Troubleshooting → Enable Developer Tools** (one-time, persists)
+4. Then **Developer menu → Hardware Buddy → Connect**
 
 ## Adding your own app
 

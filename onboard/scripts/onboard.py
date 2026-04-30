@@ -1181,6 +1181,11 @@ def main() -> int:
         sys.stderr.write(
             "Device is flashed and the app bundle is installed. Unplug, "
             "power on, and it should boot straight into the launcher.\n"
+            "\n"
+            "To connect from Claude Desktop:\n"
+            "  1. Help menu → Troubleshooting → Enable Developer Tools\n"
+            "  2. Developer menu → launch Hardware Buddy\n"
+            "Then pick 'Claude Buddy' from the device launcher and Connect.\n"
         )
     else:
         sys.stderr.write(
