@@ -406,6 +406,12 @@ class Bridge:
 bridge = Bridge()
 mcp = FastMCP("cardputer")
 
+# Populated by build_http_app() in HTTP mode: maps bearer token -> agent
+# label. Read by _agent_label() so the device banner can show *which*
+# agent is asking. Empty in stdio mode (there's no HTTP request to read a
+# token from), where the label falls back to "local".
+_TOKEN_MAP: dict[str, str] = {}
+
 
 @mcp.tool()
 async def notify(
@@ -585,14 +591,89 @@ async def confirm(
     return f"failed: {err}"
 
 
+# ---- HTTP transport (the cloud-bridge path, via an MCP tunnel) ------
+
+
+def build_http_app(
+    token_map: dict,
+    host: str = "127.0.0.1",
+    port: int = 9000,
+    tunnel_domain: Optional[str] = None,
+    extra_allowed_hosts: Optional[list] = None,
+):
+    """Build the streamable-HTTP ASGI app for the same three tools.
+
+    Reuses the module-level `mcp`/`bridge` verbatim — only the transport
+    changes. Two things are load-bearing and easy to get wrong:
+
+    1. **Host allow-list.** The MCP streamable-HTTP transport does
+       DNS-rebinding protection and replies 421 to a `Host` it doesn't
+       recognize. A tunnel forwards `Host: cardputer.<tunnel-domain>`, so
+       that host (and the loopback host:port local Claude Code uses) MUST
+       be allow-listed or every tunneled call silently fails.
+    2. **Bearer auth.** The tunnel does not authenticate to us, so we wrap
+       the app in BearerAuthMiddleware (see auth.py).
+
+    `token_map` is stashed in the module global so the tools can resolve a
+    request's token to an agent label for the device banner.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    from auth import BearerAuthMiddleware
+
+    global _TOKEN_MAP
+    _TOKEN_MAP = token_map
+
+    allowed = [f"{host}:{port}", f"127.0.0.1:{port}", f"localhost:{port}"]
+    if tunnel_domain:
+        allowed += [tunnel_domain, f"*.{tunnel_domain}"]
+    if extra_allowed_hosts:
+        allowed += list(extra_allowed_hosts)
+
+    mcp.settings.host = host
+    mcp.settings.port = port
+    mcp.settings.transport_security = TransportSecuritySettings(
+        allowed_hosts=allowed, allowed_origins=["*"]
+    )
+
+    app = mcp.streamable_http_app()
+    app.add_middleware(BearerAuthMiddleware, token_map=token_map)
+    return app
+
+
 # ---- entrypoint -----------------------------------------------------
 
 
 def main() -> None:
     _log(f"starting (pid={os.getpid()})")
-    # FastMCP.run() defaults to stdio, which is what `claude mcp add`
-    # expects. If we ever want HTTP/SSE for the cloud-bridge path,
-    # that's a different entry point — leave this one stdio-only.
+    # Default transport is stdio, which is what `claude mcp add` (no
+    # --transport) expects — the original local-only path. Setting
+    # CARDPUTER_HTTP=1 switches to the streamable-HTTP daemon that an MCP
+    # tunnel exposes to cloud agents AND that local Claude Code can reach
+    # over loopback (`claude mcp add --transport http`). One BLE owner,
+    # one gate, both transports.
+    if os.environ.get("CARDPUTER_HTTP"):
+        import uvicorn
+
+        from auth import parse_token_map
+
+        host = os.environ.get("CARDPUTER_HTTP_HOST", "127.0.0.1")
+        port = int(os.environ.get("CARDPUTER_HTTP_PORT", "9000"))
+        token_map = parse_token_map(os.environ.get("CARDPUTER_TOKENS"))
+        tunnel_domain = os.environ.get("CARDPUTER_TUNNEL_DOMAIN")
+        if not token_map:
+            _log(
+                "WARNING: CARDPUTER_TOKENS is empty — every HTTP request "
+                "will be rejected 401 (fail-closed). Set token=label pairs."
+            )
+        app = build_http_app(
+            token_map, host=host, port=port, tunnel_domain=tunnel_domain
+        )
+        _log(f"http transport on {host}:{port} (tunnel_domain={tunnel_domain})")
+        uvicorn.run(app, host=host, port=port, log_config=None)
+        return
+
+    # stdio (legacy / local fallback)
     mcp.run()
 
 

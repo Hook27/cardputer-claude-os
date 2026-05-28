@@ -1,0 +1,5 @@
+# Dev/test-only dependencies for cardputer-mcp host-side tests.
+#   pip install -r requirements.txt -r requirements-dev.txt
+# Then: python -m pytest tests/ -q
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

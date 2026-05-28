@@ -9,3 +9,9 @@ mcp>=1.0.0
 # pre-declared so `pip install -r` produces a complete environment
 # ready for iter 2.
 bleak>=0.21.0
+
+# HTTP transport (iter 5: streamable-http daemon behind an MCP tunnel).
+# starlette + uvicorn ship transitively with the mcp SDK, but the
+# tunnel/daemon path imports them directly, so pin them explicitly.
+starlette>=1.0.0
+uvicorn>=0.30.0
