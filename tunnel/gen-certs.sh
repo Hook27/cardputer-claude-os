@@ -49,9 +49,16 @@ openssl x509 -req -in /tmp/cardputer-tunnel-server.csr \
   -out data/tls.crt -days 90 -extfile data/tls.ext
 rm -f /tmp/cardputer-tunnel-server.csr
 
-# The mcp-proxy container runs as non-root (UID 65532) and must be able to
-# read the key off the read-only mount.
-chmod 644 data/tls.key
+# Keep private keys owner-only — never world-readable. On Docker Desktop
+# (macOS, the target host) the file-sharing layer still lets the proxy
+# container (UID 65532) read the bind-mounted tls.key at 0600, so this is
+# both secure and functional here.
+#
+# On NATIVE Linux Docker a 0600 host-owned key is NOT readable by UID
+# 65532 in the container — if the proxy logs "permission denied", prefer a
+# Docker named volume, or fall back to `chmod 640 data/tls.key` with a
+# group the container UID shares. Do not use 0644.
+chmod 600 data/ca.key data/tls.key
 
 echo
 echo "Done. Next:"

@@ -143,8 +143,10 @@ curl https://api.anthropic.com/v1/messages \
   (`curl -i http://127.0.0.1:9000/mcp` → 401 means it's listening) and
   that `192.168.0.0/16` is in `upstream.allowed_ips` (Docker Desktop's
   `host.docker.internal` gateway).
-- **`permission denied` reading the key** — `chmod 644 data/tls.key`
-  (the proxy runs as UID 65532).
+- **`permission denied` reading the key** — keys are `0600` (owner-only);
+  on Docker Desktop macOS the proxy (UID 65532) can still read the
+  bind-mounted key. On native Linux Docker, use a named volume or
+  `chmod 640 data/tls.key` with a shared group — never `0644`.
 - **`curl https://…:8080` says "wrong version number"** — expected; the
   proxy listener is plain WebSocket. Verify only via a Managed Agent or
   the Messages API.
