@@ -483,6 +483,10 @@ async def notify(
     )
     if result.get("ok"):
         return "shown"
+    if result.get("dnd"):
+        # Device is in Do Not Disturb; a non-critical notify was
+        # suppressed. Surface it so the agent knows it wasn't seen.
+        return "dnd"
     err = result.get("err", "unknown")
     if err.startswith("unavailable"):
         return err

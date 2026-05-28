@@ -129,3 +129,28 @@ def test_notify_threads_agent_label_from_token(client, monkeypatch):
     assert r.status_code == 200, r.text
     assert captured.get("cmd") == "notify"
     assert captured.get("agent") == "managed-agent", captured
+
+
+def test_notify_returns_dnd_when_device_suppresses(client, monkeypatch):
+    async def fake_send(cmd, payload, rpc_timeout_s=30.0, agent="mcp-client"):
+        return {"ack": cmd, "ok": False, "dnd": True}
+
+    monkeypatch.setattr(server.bridge, "send", fake_send)
+    h = _init_session(client, "tok")
+    r = client.post(
+        "/mcp",
+        headers=h,
+        json={
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "notify", "arguments": {"title": "hi"}},
+        },
+    )
+    assert r.status_code == 200, r.text
+    texts = []
+    for obj in _sse_objects(r.text):
+        for c in obj.get("result", {}).get("content", []):
+            if c.get("type") == "text":
+                texts.append(c["text"])
+    assert "dnd" in texts, texts
