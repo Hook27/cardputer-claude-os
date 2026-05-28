@@ -128,10 +128,10 @@ reach. Three tools land on first connect:
   `confirmed`. The whole point is that a prompt injection cannot
   synthesize a sustained physical keypress. Reserve this for
   irreversible operations (deploys, force pushes, DROP TABLE,
-  charges, etc.). See _Known limitations_ in
-  [`mcp/README.md`](mcp/README.md) for the current gesture
-  caveat — the screen says "HOLD Y" but on this build you tap Y
-  rapidly to advance the timer.
+  charges, etc.). On the current firmware the gesture is **rapid Y
+  taps** (the screen says "TAP Y fast for 3s") because the keyboard
+  driver has no auto-repeat — see _Known limitations_ in
+  [`mcp/README.md`](mcp/README.md).
 
 The whole stack is local — stdio MCP between your client and the
 host-side `bleak` bridge, then BLE-GATT to the device. No cloud
@@ -308,7 +308,7 @@ BLE owner and one physical gate covers cloud and local agents alike.
    Then attach `https://cardputer.<your-tunnel-domain>/mcp` (with your
    cloud bearer token) to a Managed Agent and ask it to confirm a
    destructive op — the device flashes red with `from:managed-agent`,
-   you hold Y, the agent proceeds.
+   you tap Y rapidly for ~3s, the agent proceeds.
 
 ### Security model in one breath
 

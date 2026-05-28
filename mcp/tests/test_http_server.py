@@ -37,6 +37,7 @@ def client():
     # so we can assert token -> agent-label mapping on the device banner.
     app = server.build_http_app(
         {"tok": "claude-code", "cloud": "managed-agent"},
+        tunnel_domain="abcd1234.tunnel.anthropic.com",
         extra_allowed_hosts=["testserver"],
     )
     with TestClient(app) as c:
@@ -77,6 +78,20 @@ def test_wrong_bearer_is_401(client):
     h = {**_H, "authorization": "Bearer WRONG"}
     r = client.post("/mcp", headers=h, json=_INIT)
     assert r.status_code == 401
+
+
+def test_tunnel_host_header_is_not_421(client):
+    # The Host a tunneled request actually arrives with. Must NOT be
+    # rejected by DNS-rebinding protection (the bug the *.domain entry
+    # silently caused). Bearer is valid, host is allowed -> 200.
+    h = {
+        **_H,
+        "authorization": "Bearer cloud",
+        "host": "cardputer.abcd1234.tunnel.anthropic.com",
+    }
+    r = client.post("/mcp", headers=h, json=_INIT)
+    assert r.status_code != 421, "tunnel Host rejected by rebinding protection"
+    assert r.status_code == 200, r.text
 
 
 def test_initialize_and_tools_list_with_bearer(client):

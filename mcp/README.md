@@ -18,7 +18,7 @@ The host-side bridge speaks Bluetooth Low Energy via `bleak` to the
 | ----------------------------------- | -------------------------------- | ---------------------------------- | --------------------------- |
 | `notify(title, body, urgency)`      | ✅ visual banner + speaker chirp | rate-limit, per-agent tags         | —                           |
 | `ask(question, choices, timeout_s)` | ✅ blocks on QWERTY input        | DND awareness                      | —                           |
-| `confirm(title, timeout_s)`         | —                                | ✅ HOLD Y for 3 s physical gesture | —                           |
+| `confirm(title, timeout_s)`         | —                                | ✅ TAP-Y-fast 3 s physical gesture | —                           |
 | `show(text, channel)`               | —                                | —                                  | ambient line on LCD         |
 | `dictate(prompt, max_seconds)`      | —                                | —                                  | mic → Worker/Whisper → text |
 
@@ -197,16 +197,16 @@ A short list of rough edges we're aware of in the iter-3 release.
 None blocks normal use of `notify` or `ask`; `confirm` is usable
 but its gesture is less polished than the brand promised.
 
-- **`confirm` gesture requires rapid Y presses, not a continuous
-  hold.** The screen says "HOLD Y for 3 seconds" but on UIFlow 2.0
-  the MatrixKeyboard driver does not generate auto-repeat events
-  while a key is held — `get_key()` returns a single event per
-  physical press. To advance the hold timer the user has to tap Y
-  rapidly (keep the inter-tap gap under ~300 ms). The threshold and
-  the "release detected — try again" status are honest about what
-  actually happened, but the headline label still says "HOLD"; a
-  future iter will either probe for a held-key API and switch the
-  detection over, or relabel the screen to "TAP Y rapidly".
+- **`confirm` gesture is rapid Y taps, not a continuous hold.** On
+  UIFlow 2.0 the MatrixKeyboard driver does not generate auto-repeat
+  events while a key is held — `get_key()` returns a single event per
+  physical press. So the device screen, the `confirm` tool docstring,
+  and these docs all say **"TAP Y fast for 3s"**: the user taps Y
+  repeatedly (inter-tap gap under ~300 ms) to fill the progress bar,
+  which resets if they stop. The security property is unchanged — a
+  sustained burst of physical key events still can't be synthesized by
+  tool output or prompt injection. A future iter may probe for a
+  held-key/pressed-state API and switch to a true continuous hold.
 - **Device-side resolution acks for blocking tools sometimes don't
   reach the host.** When `ask` or `confirm` hits its own
   device-supplied `timeout_s`, the device's tick-fired `timed_out`

@@ -573,18 +573,21 @@ async def confirm(
     This tool is for IRREVERSIBLE actions only — production deploys,
     force pushes, DROP TABLE / DELETE without WHERE, unstaged-file
     deletions, financial transactions, paid API calls with large
-    side effects, etc. The user must physically HOLD the Y key on
-    the Cardputer's QWERTY for 3 continuous seconds. A tap does
-    nothing; only a sustained physical gesture counts.
+    side effects, etc. The user must complete a sustained ~3-second
+    physical gesture on the Cardputer's Y key: on the current firmware
+    the hardware keyboard emits no auto-repeat, so the gesture is
+    rapid Y tapping (the on-screen prompt says "TAP Y fast for 3s") —
+    a progress bar fills as they tap and resets if they stop for more
+    than ~300 ms. A single tap is not enough.
 
     The point is that no amount of tool-output content or prompt
-    injection can synthesize a physical key-hold. If you're about to
-    do something the user couldn't un-do in a minute, use this
-    instead of trusting an `ask` or your own assistant-message
-    confirmation.
+    injection can synthesize a sustained burst of physical key events.
+    If you're about to do something the user couldn't un-do in a
+    minute, use this instead of trusting an `ask` or your own
+    assistant-message confirmation.
 
     Returns one of:
-      - 'confirmed' — user physically held Y for ≥3 s
+      - 'confirmed' — user completed the ~3 s physical Y gesture
       - 'cancelled' — user pressed N or ESC on the device
       - 'timeout' — user did not respond within `timeout_s` seconds
       - 'unavailable: <reason>' — device not connected
@@ -635,6 +638,50 @@ async def confirm(
 # ---- HTTP transport (the cloud-bridge path, via an MCP tunnel) ------
 
 
+def _allowed_hosts(
+    host: str,
+    port: int,
+    tunnel_domain: Optional[str] = None,
+    extra: Optional[list] = None,
+) -> list:
+    """Build the Host allow-list for the streamable-HTTP transport.
+
+    The MCP transport does DNS-rebinding protection: it 421s any `Host`
+    header not in this list. Its matcher only does EXACT matches and
+    `host:*` port wildcards — it does NOT understand `*.domain` prefix
+    wildcards, so we must enumerate the concrete hosts the daemon can
+    actually receive:
+
+    - loopback `127.0.0.1:port` / `localhost:port` — local Claude Code.
+    - `cardputer.<tunnel_domain>` — what the tunnel's mcp-proxy forwards
+      when it routes the `cardputer` subdomain (the bare domain too, in
+      case a proxy preserves it differently).
+    - `host.docker.internal[:port]` — in case the proxy rewrites Host to
+      the upstream target instead of preserving the original.
+    - `CARDPUTER_ALLOWED_HOSTS` (comma-separated) — escape hatch: if you
+      ever see "Invalid Host header: X" in the proxy/daemon logs, add X
+      here without a code change.
+
+    This is defense-in-depth; the bearer token (checked first, in
+    BearerAuthMiddleware) is the real gate.
+    """
+    allowed = [
+        f"{host}:{port}",
+        f"127.0.0.1:{port}",
+        f"localhost:{port}",
+        f"host.docker.internal:{port}",
+        "host.docker.internal",
+    ]
+    if tunnel_domain:
+        allowed += [tunnel_domain, f"cardputer.{tunnel_domain}"]
+    env_extra = os.environ.get("CARDPUTER_ALLOWED_HOSTS")
+    if env_extra:
+        allowed += [h.strip() for h in env_extra.split(",") if h.strip()]
+    if extra:
+        allowed += list(extra)
+    return allowed
+
+
 def build_http_app(
     token_map: dict,
     host: str = "127.0.0.1",
@@ -647,13 +694,12 @@ def build_http_app(
     Reuses the module-level `mcp`/`bridge` verbatim — only the transport
     changes. Two things are load-bearing and easy to get wrong:
 
-    1. **Host allow-list.** The MCP streamable-HTTP transport does
-       DNS-rebinding protection and replies 421 to a `Host` it doesn't
-       recognize. A tunnel forwards `Host: cardputer.<tunnel-domain>`, so
-       that host (and the loopback host:port local Claude Code uses) MUST
-       be allow-listed or every tunneled call silently fails.
+    1. **Host allow-list** (see `_allowed_hosts`) — without the right
+       entries the transport 421s tunneled requests via DNS-rebinding
+       protection.
     2. **Bearer auth.** The tunnel does not authenticate to us, so we wrap
-       the app in BearerAuthMiddleware (see auth.py).
+       the app in BearerAuthMiddleware (see auth.py). It's added last, so
+       it runs FIRST (outermost) — auth before transport-security.
 
     `token_map` is stashed in the module global so the tools can resolve a
     request's token to an agent label for the device banner.
@@ -665,16 +711,15 @@ def build_http_app(
     global _TOKEN_MAP
     _TOKEN_MAP = token_map
 
-    allowed = [f"{host}:{port}", f"127.0.0.1:{port}", f"localhost:{port}"]
-    if tunnel_domain:
-        allowed += [tunnel_domain, f"*.{tunnel_domain}"]
-    if extra_allowed_hosts:
-        allowed += list(extra_allowed_hosts)
-
     mcp.settings.host = host
     mcp.settings.port = port
+    # Keep DNS-rebinding host protection on (defense-in-depth). We leave
+    # allowed_origins at its default ([]): server-side callers (Managed
+    # Agents, the Messages API) send no Origin header, which always passes;
+    # the matcher has no real wildcard for origins anyway, and bearer auth
+    # is the actual gate.
     mcp.settings.transport_security = TransportSecuritySettings(
-        allowed_hosts=allowed, allowed_origins=["*"]
+        allowed_hosts=_allowed_hosts(host, port, tunnel_domain, extra_allowed_hosts)
     )
 
     app = mcp.streamable_http_app()
