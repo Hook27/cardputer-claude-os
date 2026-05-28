@@ -59,7 +59,7 @@ _RX_CHAR = (RX_UUID, _FLAG_WRITE | _FLAG_WRITE_NR)
 _TX_CHAR = (TX_UUID, _FLAG_READ | _FLAG_NOTIFY)
 _SVC = (SERVICE_UUID, (_RX_CHAR, _TX_CHAR))
 
-_FW_VERSION = "0.2.0"
+_FW_VERSION = "0.3.0"
 _CAPS = ["notify", "ask", "confirm"]
 _MTU = 20  # default ATT MTU minus framing; chunk every TX write at this
 
@@ -437,6 +437,13 @@ class App:
         self.state = "idle"  # "idle" | "notify" | "ask" | "confirm"
         self.ble_connected = False
 
+        # Do Not Disturb. Toggled with the D key on the idle/notify
+        # screen. When on, `notify` (non-crit) and `ask` are suppressed
+        # and acked with {"dnd": True} so the agent knows to back off.
+        # `confirm` ALWAYS rings regardless — a destructive op must wait
+        # for a real human decision, never be silently auto-deferred.
+        self.dnd = False
+
         # Notify state.
         self.notify_data = None  # {"title", "body", "urgency"}
         self.notify_expires_at = 0
@@ -498,10 +505,16 @@ class App:
             )
 
     def _cmd_notify(self, msg, mid):
+        urgency = msg.get("urgency", "info")
+        if self.dnd and urgency != "crit":
+            # Do Not Disturb: suppress non-critical banners + chirp. A
+            # crit notify still comes through as a genuine heads-up.
+            self.ble.send({"ack": "notify", "id": mid, "ok": False, "dnd": True})
+            return
         self.notify_data = {
             "title": str(msg.get("title", ""))[:64],
             "body": str(msg.get("body", ""))[:240],
-            "urgency": msg.get("urgency", "info"),
+            "urgency": urgency,
         }
         self.notify_expires_at = time.ticks_add(time.ticks_ms(), _NOTIFY_LINGER_MS)
         # Notify never pre-empts a blocking modal — the user is in the
@@ -517,6 +530,11 @@ class App:
         self.ble.send({"ack": "notify", "id": mid, "ok": True})
 
     def _cmd_ask(self, msg, mid):
+        if self.dnd:
+            # Do Not Disturb: don't interrupt with a question. The agent
+            # gets a clean 'dnd' and decides whether to wait or proceed.
+            self.ble.send({"ack": "ask", "id": mid, "ok": False, "dnd": True})
+            return
         choices_in = msg.get("choices", [])
         if not isinstance(choices_in, list) or len(choices_in) < 2 or len(choices_in) > 4:
             self.ble.send(
@@ -555,6 +573,7 @@ class App:
             "question": str(msg.get("question", ""))[:120],
             "choices": [str(c)[:32] for c in choices_in],
             "deadline": time.ticks_add(time.ticks_ms(), timeout_s * 1000),
+            "agent": str(msg.get("agent", ""))[:20],
         }
         self.state = "ask"
         self._dirty = True
@@ -636,6 +655,7 @@ class App:
             "title": title,
             "danger": danger,
             "deadline": time.ticks_add(time.ticks_ms(), timeout_s * 1000),
+            "agent": str(msg.get("agent", ""))[:20],
         }
         # Start with no hold in progress. Even if the user happened to
         # be holding Y from the prior screen, they restart from zero —
@@ -748,7 +768,11 @@ class App:
                 return True
             return False
 
-        # idle or notify: any of Q, ESC exits.
+        # idle or notify: D toggles Do Not Disturb; Q / ESC exit.
+        if isinstance(k, int) and k in (ord("d"), ord("D")):
+            self.dnd = not self.dnd
+            self._dirty = True
+            return False
         if _is_q(k):
             return True
         if isinstance(k, int) and k == 0x1B:
@@ -843,6 +867,12 @@ class App:
         _LCD.setTextColor(_ORANGE, _DARK)
         _LCD.drawString("Cardputer MCP", 6, 5)
 
+        # Do Not Disturb chip — yellow when on. Confirm still rings.
+        if self.dnd:
+            chip = "DND"
+            _LCD.setTextColor(_YELLOW, _DARK)
+            _LCD.drawString(chip, _W - _LCD.textWidth(chip) - 6, 5)
+
         # Status line — green when an MCP host is paired, gray otherwise.
         status_text = "READY" if self.ble_connected else "waiting for bridge"
         status_color = _GREEN if self.ble_connected else _GRAY_MID
@@ -860,7 +890,7 @@ class App:
 
         _LCD.fillRect(0, _H - 18, _W, 18, _DARK)
         _LCD.setTextColor(_GRAY_MID, _DARK)
-        hint = "Q  back to menu"
+        hint = "Q menu   D:DND {}".format("on" if self.dnd else "off")
         _LCD.drawString(hint, (_W - _LCD.textWidth(hint)) // 2, _H - 14)
 
     def _draw_notify(self):
@@ -915,6 +945,14 @@ class App:
         _LCD.setTextColor(_ORANGE, _DARK)
         _LCD.drawString("ASK", 6, 5)
 
+        # Which agent is asking — derived from its bearer token by the
+        # host, so it can't be forged in the tool arguments.
+        agent = self.pending_ask.get("agent") or ""
+        if agent:
+            label = "from:" + agent
+            _LCD.setTextColor(_GRAY_MID, _DARK)
+            _LCD.drawString(label, _W - _LCD.textWidth(label) - 6, 5)
+
         # Question (size 1, wraps at ~38 chars, max 2 lines).
         question = self.pending_ask["question"]
         q_lines = [question[i : i + 38] for i in range(0, len(question), 38)][:2]
@@ -958,6 +996,14 @@ class App:
         _LCD.setTextColor(_CREAM, _RED)
         _LCD.drawString("DANGER  CONFIRM", 6, 5)
 
+        # Which agent is demanding this — token-derived, unforgeable. The
+        # user should know WHO wants the irreversible op before consenting.
+        agent = self.pending_confirm.get("agent") or ""
+        if agent:
+            label = "from:" + agent[:14]
+            _LCD.setTextColor(_CREAM, _RED)
+            _LCD.drawString(label, _W - _LCD.textWidth(label) - 6, 5)
+
         # Title — size 2 for weight; truncated to fit one line. We
         # deliberately do NOT wrap the title: if the action is too
         # complex to describe in 18 chars, the host is over-using
@@ -967,11 +1013,17 @@ class App:
         title = self.pending_confirm["title"][:18]
         _LCD.drawString(title, (_W - _LCD.textWidth(title)) // 2, 28)
 
-        # Instruction line. Plain, unambiguous, telegraphs the
-        # gesture without any "press to continue" ambiguity.
+        # Instruction line. Honest about the actual gesture: on UIFlow
+        # 2.0 the MatrixKeyboard emits one event per press (no auto-repeat
+        # while held), so the sustained-input gesture is rapid tapping,
+        # not a literal hold. The security property is unchanged — a
+        # sustained burst of physical key events still can't be
+        # synthesized by tool output / prompt injection. (If a future
+        # build exposes a held-key/pressed-state API, switch to a true
+        # continuous hold and relabel back.)
         _LCD.setTextSize(1)
         _LCD.setTextColor(_CREAM, _BLACK)
-        instr = "HOLD Y for 3 seconds"
+        instr = "TAP Y fast for 3s"
         _LCD.drawString(instr, (_W - _LCD.textWidth(instr)) // 2, 60)
 
         # Progress bar. Empty outline always visible; fills red as the
@@ -1002,10 +1054,10 @@ class App:
             held_ms = time.ticks_diff(time.ticks_ms(), self._y_held_since_ms)
             remaining = max(0, _CONFIRM_HOLD_MS - held_ms)
             secs = remaining / 1000.0
-            status = "holding... {:.1f}s left".format(secs)
+            status = "keep tapping {:.1f}s".format(secs)
             _LCD.setTextColor(_RED, _BLACK)
         else:
-            status = "release detected - try again"
+            status = "stopped - tap faster"
             _LCD.setTextColor(_GRAY_MID, _BLACK)
         # Suppress the "release detected" string on first paint when
         # the user hasn't tried yet. _y_held_since_ms is None at start
@@ -1013,14 +1065,14 @@ class App:
         # seen Y, show a quiet hint instead of a misleading "release"
         # message.
         if self._y_held_since_ms is None and self._last_y_seen_ms is None:
-            status = "press and hold Y"
+            status = "tap Y rapidly"
             _LCD.setTextColor(_GRAY_MID, _BLACK)
         _LCD.drawString(status, (_W - _LCD.textWidth(status)) // 2, 96)
 
         # Hint strip — same shape as other states.
         _LCD.fillRect(0, _H - 18, _W, 18, _DARK)
         _LCD.setTextColor(_GRAY_MID, _DARK)
-        hint = "HOLD Y - N/ESC cancel"
+        hint = "TAP Y - N/ESC cancel"
         _LCD.drawString(hint, (_W - _LCD.textWidth(hint)) // 2, _H - 14)
 
     def teardown(self):
