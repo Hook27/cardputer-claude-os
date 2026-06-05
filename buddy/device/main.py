@@ -328,6 +328,16 @@ def _draw_chrome(apps, cursor, scroll_top=0):
     _LCD.setTextColor(pip_color, _DARK)
     _LCD.drawString(pip_text, _W - _LCD.textWidth(pip_text) - 6, 5)
 
+        # Battery level on the right, before the WiFi pip
+    try:
+        batt = M5.Power.getBatteryLevel()
+        batt_text = "{}%".format(batt)
+        batt_x = _W - _LCD.textWidth(pip_text) - _LCD.textWidth(batt_text) - 14
+        _LCD.setTextColor(_GRAY_MID, _DARK)
+        _LCD.drawString(batt_text, batt_x, 5)
+    except Exception:
+        pass
+
     # Menu rows constrained to the left region so the burst animation
     # has clean space on the right. Only _MAX_VISIBLE rows are shown at
     # once; scroll_top is the index of the first visible app.
