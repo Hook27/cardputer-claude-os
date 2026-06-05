@@ -132,6 +132,22 @@ def _beep():
         print("pidash: beep skipped:", e)
 
 
+def _beep_hot():
+    """Urgent temperature alarm: three short high-pitched beeps. Same
+    defensive guards as _beep() — M5.Speaker may be absent or vary by
+    build, so any failure falls through silently."""
+    try:
+        spk = M5.Speaker
+    except Exception:
+        return
+    try:
+        for _ in range(3):
+            spk.tone(1400, 80)
+            time.sleep_ms(70)
+    except Exception as e:
+        print("pidash: hot beep skipped:", e)
+
+
 # ---- chrome ---------------------------------------------------------
 
 
@@ -355,6 +371,16 @@ def _poll_all(state):
             try:
                 row["hostname"] = data.get("hostname")
                 row["temp_c"] = float(data.get("temp_c"))
+                # Edge-triggered temperature alarm: sound once when this
+                # Pi first crosses _HOT_C, and re-arm only after it drops
+                # back below — so we don't beep every poll while it stays
+                # hot. Latch is per-Pi so each triggers independently.
+                if row["temp_c"] > _HOT_C:
+                    if not row["hot"]:
+                        row["hot"] = True
+                        _beep_hot()
+                else:
+                    row["hot"] = False
                 row["uptime"] = data.get("uptime") or "?"
                 row["updates"] = int(data.get("updates") or 0)
                 row["disk_free_gb"] = float(data.get("disk_free_gb") or 0.0)
@@ -416,6 +442,7 @@ def _new_state():
             "disk_free_gb": 0.0,
             "stamp": None,
             "error": "...",
+            "hot": False,  # edge-trigger latch for the temperature alarm
         }
         for _ in _PIS
     ]
