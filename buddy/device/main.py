@@ -322,22 +322,6 @@ def _draw_chrome(apps, cursor, scroll_top=0):
     _LCD.setTextColor(_ORANGE, _DARK)
     _LCD.drawString("Claude Buddy Launcher", 6, 5)
 
-    # WiFi status pip on the header's right side. Reads the cached
-    # _wifi_status set by _connect_wifi_with_splash on boot.
-    pip_text, pip_color = _wifi_pip_label()
-    _LCD.setTextColor(pip_color, _DARK)
-    _LCD.drawString(pip_text, _W - _LCD.textWidth(pip_text) - 6, 5)
-
-        # Battery level on the right, before the WiFi pip
-    try:
-        batt = M5.Power.getBatteryLevel()
-        batt_text = "{}%".format(batt)
-        batt_x = _W - _LCD.textWidth(pip_text) - _LCD.textWidth(batt_text) - 14
-        _LCD.setTextColor(_GRAY_MID, _DARK)
-        _LCD.drawString(batt_text, batt_x, 5)
-    except Exception:
-        pass
-
     # Menu rows constrained to the left region so the burst animation
     # has clean space on the right. Only _MAX_VISIBLE rows are shown at
     # once; scroll_top is the index of the first visible app.
@@ -372,9 +356,25 @@ def _draw_chrome(apps, cursor, scroll_top=0):
     hint = "; . up/down   Enter launch"
     _LCD.drawString(hint, (_W - _LCD.textWidth(hint)) // 2, _H - 14)
 
-    # Paint the initial burst frame so the animation region isn't
-    # just a black square until the first tick fires.
-    _draw_burst_frame(0)
+    # Right region (the old burst bounding box) now shows status info:
+    # WiFi state centered in the upper half, battery % in the lower half.
+    wifi_text, wifi_color = _wifi_pip_label()
+    _LCD.setTextSize(1)
+    _LCD.setTextColor(wifi_color, _BLACK)
+    wifi_x = _BURST_X + (_BURST_W - _LCD.textWidth(wifi_text)) // 2
+    wifi_y = _BURST_Y + _BURST_H // 4 - 4
+    _LCD.drawString(wifi_text, wifi_x, wifi_y)
+
+    try:
+        batt = M5.Power.getBatteryLevel()
+        batt_text = "{}%".format(batt)
+        _LCD.setTextSize(2)
+        _LCD.setTextColor(_GRAY_MID, _BLACK)
+        batt_x = _BURST_X + (_BURST_W - _LCD.textWidth(batt_text)) // 2
+        batt_y = _BURST_Y + 3 * _BURST_H // 4 - 8
+        _LCD.drawString(batt_text, batt_x, batt_y)
+    except Exception:
+        pass
 
 
 def _intent(k):
@@ -522,9 +522,9 @@ def main():
     # frame. The burst region is disjoint from the menu/chrome, so we
     # never need to repaint the menu just because the animation
     # advanced; we only repaint the burst's own bounding box.
-    frame = 0
-    frame_ms = _burst.FRAME_MS if _burst is not None else 80
-    last_frame_ms = time.ticks_ms()
+    # frame = 0
+    # frame_ms = _burst.FRAME_MS if _burst is not None else 80
+    # last_frame_ms = time.ticks_ms()
 
     while True:
         kb.tick()
@@ -561,11 +561,11 @@ def main():
         # handles wrap-around safely (ticks_ms rolls over every ~9
         # hours on MicroPython; not a real concern on a launcher but
         # cheap insurance).
-        now = time.ticks_ms()
-        if time.ticks_diff(now, last_frame_ms) >= frame_ms:
-            frame += 1
-            _draw_burst_frame(frame)
-            last_frame_ms = now
+        # now = time.ticks_ms()
+        # if time.ticks_diff(now, last_frame_ms) >= frame_ms:
+        #    frame += 1
+        #    _draw_burst_frame(frame)
+        #    last_frame_ms = now
 
         time.sleep_ms(40)
 
