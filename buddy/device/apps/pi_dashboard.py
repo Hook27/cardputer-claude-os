@@ -21,12 +21,15 @@ at the bottom. **NC-Pi5** (192.168.178.45) is the LEFT card,
 
 ### Pages
 
-Three pages auto-rotate every 5 s and are also switchable with the
+Six pages auto-rotate every 5 s and are also switchable with the
 left / right arrow keys (``,`` and ``/`` on the Cardputer-Adv cluster):
 
   1. CPU temperature  — green normally, red at >= 70 C
   2. Uptime
   3. Updates + free disk
+  4. RAM            — used/total MB + %, green/orange/red by load
+  5. Tailscale      — connected yes/no + peer count
+  6. Docker / Pi-hole — containers (left card) + Pi-hole stats (right)
 
 If either Pi reports ``updates > 0`` we chirp the speaker once (edge-
 triggered, so it sounds when the condition first appears rather than
@@ -93,7 +96,10 @@ except Exception:
     )
 
 # Page identifiers and their header labels.
-_PAGE_TITLES = ("CPU temp", "Uptime", "Updates / disk")
+_PAGE_TITLES = (
+    "CPU temp", "Uptime", "Updates / disk",
+    "RAM", "Tailscale", "Docker / Pi-hole",
+)
 _N_PAGES = len(_PAGE_TITLES)
 
 # Cadences, all in milliseconds.
@@ -243,8 +249,19 @@ def _draw_card(index, page, row):
         _draw_temp(cx, row)
     elif page == 1:
         _draw_uptime(cx, w, row)
-    else:
+    elif page == 2:
         _draw_updates_disk(cx, row)
+    elif page == 3:
+        _draw_ram(cx, row)
+    elif page == 4:
+        _draw_tailscale(cx, row)
+    else:
+        # Page 6 is card-specific: Docker on the left (NC-Pi5), Pi-hole
+        # on the right (TaSc-Pi5).
+        if index == 0:
+            _draw_docker(x0, w, row)
+        else:
+            _draw_pihole(cx, row)
 
     # Last-update timestamp, dim, at the foot of the card.
     _LCD.setTextSize(1)
@@ -288,6 +305,88 @@ def _draw_updates_disk(cx, row):
     _LCD.setTextColor(_CREAM, _BLACK)
     disk_line = "{:.1f} GB free".format(row["disk_free_gb"])
     _LCD.drawString(disk_line, cx - _LCD.textWidth(disk_line) // 2, _TOP + 48)
+
+
+def _draw_ram(cx, row):
+    """Page 4: RAM use as a headline percentage (size 2) plus the raw
+    used/total MB below. Green < 80%, orange 80-90%, red > 90%."""
+    used = row["ram_used_mb"]
+    total = row["ram_total_mb"]
+    pct = (used * 100.0 / total) if total else 0.0
+    if pct > 90:
+        color = _RED
+    elif pct >= 80:
+        color = _ORANGE
+    else:
+        color = _GREEN
+    _LCD.setTextSize(2)
+    _LCD.setTextColor(color, _BLACK)
+    head = "{:.0f}%".format(pct)
+    _LCD.drawString(head, cx - _LCD.textWidth(head) // 2, _TOP + 26)
+    _LCD.setTextSize(1)
+    _LCD.setTextColor(_CREAM, _BLACK)
+    line = "{} / {} MB".format(used, total)
+    _LCD.drawString(line, cx - _LCD.textWidth(line) // 2, _TOP + 52)
+
+
+def _draw_tailscale(cx, row):
+    """Page 5: Tailscale connectivity (yes/no, size 2, green/red) and the
+    visible peer count below."""
+    connected = row["tailscale_connected"]
+    _LCD.setTextSize(2)
+    _LCD.setTextColor(_GREEN if connected else _RED, _BLACK)
+    head = "YES" if connected else "NO"
+    _LCD.drawString(head, cx - _LCD.textWidth(head) // 2, _TOP + 26)
+    _LCD.setTextSize(1)
+    _LCD.setTextColor(_CREAM, _BLACK)
+    peers = row["tailscale_peers"]
+    line = "{} peer{}".format(peers, "" if peers == 1 else "s")
+    _LCD.drawString(line, cx - _LCD.textWidth(line) // 2, _TOP + 52)
+
+
+def _draw_docker(x0, w, row):
+    """Page 6, left card: up to 4 Docker containers, left-aligned, with a
+    green UP / red DOWN flag and the shortened name. 'N/A' if no data."""
+    _LCD.setTextSize(1)
+    containers = row["docker_containers"]
+    if not containers:
+        _LCD.setTextColor(_GRAY_MID, _BLACK)
+        msg = "N/A"
+        _LCD.drawString(msg, x0 + w // 2 - _LCD.textWidth(msg) // 2, _TOP + 34)
+        return
+    y = _TOP + 20
+    for c in containers[:4]:
+        up = c.get("status") == "running"
+        _LCD.setTextColor(_GREEN if up else _RED, _BLACK)
+        label = "{} {}".format("UP" if up else "DN", c.get("name", "")[:14])
+        _LCD.drawString(label, x0 + 4, y)
+        y += 13
+
+
+def _draw_pihole(cx, row):
+    """Page 6, right card: Pi-hole queries / blocked / blocked-% and the
+    enabled-disabled status (green/red). 'N/A' if no data."""
+    _LCD.setTextSize(1)
+    if row["pihole_queries"] is None:
+        _LCD.setTextColor(_GRAY_MID, _BLACK)
+        msg = "N/A"
+        _LCD.drawString(msg, cx - _LCD.textWidth(msg) // 2, _TOP + 34)
+        return
+    y = _TOP + 16
+    _LCD.setTextColor(_CREAM, _BLACK)
+    q_line = "{} queries".format(row["pihole_queries"])
+    _LCD.drawString(q_line, cx - _LCD.textWidth(q_line) // 2, y)
+    y += 14
+    b_line = "{} blocked".format(row["pihole_blocked"])
+    _LCD.drawString(b_line, cx - _LCD.textWidth(b_line) // 2, y)
+    y += 14
+    _LCD.setTextColor(_YELLOW, _BLACK)
+    pct_line = "{:.1f}%".format(row["pihole_blocked_pct"])
+    _LCD.drawString(pct_line, cx - _LCD.textWidth(pct_line) // 2, y)
+    y += 14
+    status = row["pihole_status"] or "?"
+    _LCD.setTextColor(_GREEN if status == "enabled" else _RED, _BLACK)
+    _LCD.drawString(status, cx - _LCD.textWidth(status) // 2, y)
 
 
 def _draw_page(page, state):
@@ -384,6 +483,18 @@ def _poll_all(state):
                 row["uptime"] = data.get("uptime") or "?"
                 row["updates"] = int(data.get("updates") or 0)
                 row["disk_free_gb"] = float(data.get("disk_free_gb") or 0.0)
+                row["ram_used_mb"] = int(data.get("ram_used_mb") or 0)
+                row["ram_total_mb"] = int(data.get("ram_total_mb") or 0)
+                row["tailscale_connected"] = bool(
+                    data.get("tailscale_connected"))
+                row["tailscale_peers"] = int(data.get("tailscale_peers") or 0)
+                row["docker_containers"] = data.get("docker_containers") or []
+                # Pi-hole fields stay None when the server reports null
+                # (e.g. NC-Pi5 has no Pi-hole) so the card shows N/A.
+                row["pihole_queries"] = data.get("pihole_queries")
+                row["pihole_blocked"] = data.get("pihole_blocked")
+                row["pihole_blocked_pct"] = data.get("pihole_blocked_pct")
+                row["pihole_status"] = data.get("pihole_status")
                 row["stamp"] = _now_hms()
                 row["error"] = None
                 if row["updates"] > 0:
@@ -440,6 +551,15 @@ def _new_state():
             "uptime": None,
             "updates": 0,
             "disk_free_gb": 0.0,
+            "ram_used_mb": 0,
+            "ram_total_mb": 0,
+            "tailscale_connected": False,
+            "tailscale_peers": 0,
+            "docker_containers": [],
+            "pihole_queries": None,
+            "pihole_blocked": None,
+            "pihole_blocked_pct": None,
+            "pihole_status": None,
             "stamp": None,
             "error": "...",
             "hot": False,  # edge-trigger latch for the temperature alarm
