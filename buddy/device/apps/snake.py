@@ -20,9 +20,10 @@
   The Basic's "B flips vertical" single-axis mapping was clever for
   three physical buttons but unnecessary here — with two 4-way
   schemes we do classic 4-directional Snake.
-- `Q` exits back to UIFlow's App List. UIFlow 2.0 has no
-  return-to-launcher API (same constraint claude_buddy hits), so
-  exit is a soft `machine.reset()` inside a `finally` block.
+- `Q` exits back to UIFlow's App List. `run()` returns cleanly and we
+  drop ourselves from `sys.modules` in a `finally` so the launcher
+  repaints its menu and a re-selection re-runs us (same pattern as
+  pi_dashboard / particle_life).
 - Per-poll input model mirrors claude_buddy's loop: `kb.tick()` on
   every 40 ms pass, read via `kb.get_key()`. MatrixKeyboard's tick
   debounces internally; the classic direction-latching trick
@@ -40,10 +41,10 @@
 """
 
 import random
+import sys
 import time
 
 import M5
-import machine
 from hardware import MatrixKeyboard
 
 
@@ -278,19 +279,24 @@ def run():
             if _game_over(kb, score) == "exit":
                 return
     finally:
-        # Mirror claude_buddy's exit protocol: clear the screen
-        # before the soft reset so the launcher doesn't briefly
-        # flash the last frame of the prior app.
+        # Clear the screen so the launcher doesn't briefly flash the
+        # last frame of the game before it repaints its menu.
         try:
             _LCD.fillScreen(_BLACK)
         except Exception as e:
             print("snake: clear warning:", e)
-        time.sleep_ms(200)
-        machine.reset()
 
 
 # UIFlow's App List has been observed to invoke apps both as
-# __main__ and via import. The previous if/else with both arms
-# calling run() was self-cancelling; the empirical behavior is
-# always-run, so just call run() bare.
-run()
+# __main__ and via import. Run bare; that's the empirical behavior.
+#
+# Return-to-launcher (no machine.reset): when run() returns, the
+# launcher's _launch sees __import__ complete and repaints its menu.
+# We drop ourselves from sys.modules in the finally so a *second*
+# selection re-runs the module body (otherwise __import__ would hit
+# the cached entry and never call run() again). Same pattern as
+# pi_dashboard / particle_life.
+try:
+    run()
+finally:
+    sys.modules.pop(__name__, None)

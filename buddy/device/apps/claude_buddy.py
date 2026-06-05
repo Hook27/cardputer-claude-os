@@ -33,12 +33,12 @@ keys that have both — Enter (0x0D) and Escape (0x1B).
 
 ### Return-to-menu
 
-UIFlow 2.0 has no return-to-launcher API; when a user app's `run()`
-ends, the launcher does not repaint and the screen stays frozen on
-whatever the app drew last. The established workaround (see
-`hello_cardputer.py`) is to soft-reboot via `machine.reset()` on exit,
-which lands the user back at the launcher automatically. We do that
-here, in the `finally` block, *after* tearing BLE down cleanly.
+When `run()` returns, the launcher's `_launch` sees our `__import__`
+complete and repaints its menu — no `machine.reset()` needed. The
+`finally` block tears BLE down cleanly and clears the screen first,
+then we drop ourselves from `sys.modules` (at the bottom of this file)
+so a re-selection re-runs the module body. Same pattern as
+pi_dashboard / particle_life.
 """
 
 import sys
@@ -61,7 +61,6 @@ for _p in ("/flash", "/flash/apps"):
 import time
 
 import M5
-import machine
 from hardware import MatrixKeyboard
 
 import buddy_ble
@@ -372,12 +371,6 @@ def run():
             M5.Lcd.fillScreen(buddy_ui.BLACK)
         except Exception as e:
             print("claude_buddy: screen-clear warning:", e)
-        # UIFlow has no launcher-return API; machine.reset() is the
-        # only way back to App List. Same pattern hello_cardputer.py
-        # uses. Brief pause so any trailing BLE log doesn't get
-        # truncated mid-line on the USB console.
-        time.sleep_ms(200)
-        machine.reset()
 
 
 # UIFlow 2.4.x's App List has been observed to invoke apps both as
@@ -389,4 +382,13 @@ def run():
 # from CPython for inspection will trigger a BLE init — but the
 # imports above (M5, hardware, bluetooth) already only resolve
 # on-device, so that path isn't a real use case.
-run()
+#
+# Return-to-launcher (no machine.reset): run()'s finally tears BLE
+# down and clears the screen, then we drop ourselves from sys.modules
+# so the launcher repaints its menu and a re-selection re-runs the
+# module body (otherwise __import__ would hit the cached entry and
+# never call run() again). Same pattern as pi_dashboard / particle_life.
+try:
+    run()
+finally:
+    sys.modules.pop(__name__, None)
