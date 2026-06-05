@@ -11,3 +11,4 @@ venv/
 buddy/device/apps/config.py
 worker/.dev.vars
 worker/.wrangler/
+buddy/device/wifi_event.py

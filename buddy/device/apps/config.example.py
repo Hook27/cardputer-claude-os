@@ -17,3 +17,10 @@ WORKER_BASE = ""
 #   wrangler secret put DEVICE_SECRET
 # Generate one with: ``openssl rand -base64 32`` (or any random 32+ char string).
 DEVICE_SECRET = ""
+
+# Pi Dashboard endpoints — left card, right card.
+# Format: "http://<ip>:<port>/temp"
+PI_ENDPOINTS = (
+    "",
+    "",
+)
