@@ -55,6 +55,14 @@ class BuddyProtocol:
         # Tracks the currently-displayed prompt so button handlers know
         # which id to answer. None means "nothing pending".
         self._pending = permission_pending or {"id": None, "tool": None, "hint": None}
+        # Edge-triggered "needs your attention" flag. Set when a fresh
+        # prompt id first appears (or an unpair confirmation arrives) and
+        # drained by the run loop via take_alert(), which turns it into an
+        # audible chirp. Kept as a plain bool — set from BLE-callback
+        # context, read/cleared from the main loop — so the loop owns the
+        # actual sound (a ~150 ms Speaker.tone() blocking inside the IRQ
+        # would starve the BLE controller; see claude_buddy.py main loop).
+        self._alert = False
         self._boot_ms = time.ticks_ms()
         # Unpair confirmation state. _unpair_pending_ms == 0 means
         # nothing pending; nonzero is the time.ticks_ms() when the
@@ -96,6 +104,7 @@ class BuddyProtocol:
             # model. Re-arming the timer on duplicate requests is fine
             # — the user just sees the prompt persist.
             self._unpair_pending_ms = time.ticks_ms() or 1  # avoid 0
+            self._alert = True
             self.ui.show_unpair_prompt()
             self._send({
                 "ack": "unpair",
@@ -141,6 +150,13 @@ class BuddyProtocol:
         self.ui.update_heartbeat(hb)
         prompt = hb.get("prompt")
         if prompt and prompt.get("id"):
+            # Edge-trigger the attention chirp only when this is a
+            # *different* prompt than the one already on screen.
+            # Heartbeats repeat the same prompt every poll, so comparing
+            # ids keeps us from beeping on every tick while one permission
+            # request sits unanswered.
+            if prompt.get("id") != self._pending.get("id"):
+                self._alert = True
             self._pending = {
                 "id": prompt.get("id"),
                 "tool": prompt.get("tool"),
@@ -192,6 +208,19 @@ class BuddyProtocol:
 
     def has_pending(self) -> bool:
         return self._pending.get("id") is not None
+
+    def take_alert(self) -> bool:
+        """Return True once when a new prompt/unpair needs the user.
+
+        Edge-triggered and self-clearing: the run loop polls this every
+        tick and chirps the speaker on a True. Reading consumes the flag
+        so a single new prompt yields exactly one beep, no matter how
+        many heartbeats repeat it.
+        """
+        if self._alert:
+            self._alert = False
+            return True
+        return False
 
     def unpair_pending(self) -> bool:
         """True iff a host-issued unpair is awaiting on-device Y/N.

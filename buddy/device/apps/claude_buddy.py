@@ -84,6 +84,29 @@ def _stub_battery():
     return {"pct": 100, "mV": 0, "mA": 0, "usb": True}
 
 
+# ---- confirmation chirp
+#
+# Two-note rising beep to draw your eyes to the screen when the desktop
+# asks for an approve/deny (or an unpair confirmation) you have to answer
+# on the device. Same defensive shape as pi_dashboard._beep(): M5.Speaker
+# isn't guaranteed on every build and its API has been observed to vary,
+# so any failure falls through silently — the on-screen prompt is the
+# primary channel; the sound is just a nudge. Called only from the main
+# loop (never BLE-callback context) because tone() blocks for the note
+# duration, and blocking inside the BLE IRQ would starve the controller.
+def _beep_confirm():
+    try:
+        spk = M5.Speaker
+    except Exception:
+        return
+    try:
+        spk.tone(1175, 90)
+        time.sleep_ms(70)
+        spk.tone(1568, 120)
+    except Exception as e:
+        print("claude_buddy: beep skipped:", e)
+
+
 # ---- key adapter
 #
 # We translate the raw key from MatrixKeyboard into one of three
@@ -307,6 +330,15 @@ def run():
             if new_pk is not None:
                 pending_passkey[0] = None
                 ui.show_passkey(new_pk)
+
+            # Audible nudge when a fresh prompt or unpair confirmation
+            # lands. take_alert() is edge-triggered and self-clearing, so
+            # this beeps exactly once per new request — not on every
+            # heartbeat that re-advertises the same pending prompt. Drained
+            # here (not in the BLE callback) so the blocking tone() can't
+            # stall the radio.
+            if proto.take_alert():
+                _beep_confirm()
 
             kb.tick()
             k = kb.get_key()
