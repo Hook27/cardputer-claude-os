@@ -12,3 +12,6 @@ buddy/device/apps/config.py
 worker/.dev.vars
 worker/.wrangler/
 buddy/device/wifi_event.py
+
+# Lokaal gearchiveerde Claude-gesprekken (niet naar GitHub)
+pi-temp-server-m5stack-monitor-sessie.md
