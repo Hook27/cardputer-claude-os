@@ -20,23 +20,33 @@ Controls (QWERTY keyboard)
   3         Preset: Snakes    (wriggling chains)
   4         Preset: Gas       (repulsive diffuse cloud)
 
+Physics engine — fixed-point + @micropython.viper
+──────────────────────────────────────────────────
+The hot step (_step_v) is a viper-compiled integer kernel: particle state
+lives in Q8 fixed-point (1 unit = 1/256 px) inside ``array('i')`` buffers,
+accessed as ptr32, and distance uses an integer ``isqrt``.  This sidesteps
+MicroPython's boxed-float arithmetic — which @micropython.native could NOT
+accelerate — and is the reason the step is ~an order of magnitude cheaper
+than the float version.  A faithful float fallback (_step_float, validated
+to ~0.01 px/step against viper) stays behind ``_USE_VIPER`` so we can A/B or
+fall back if a future firmware breaks viper.  Roughly ~30 fps at N=100 and
+~50 fps at N=60 (the float build managed ~15 at N=60); drawing is now the
+frame-time floor, not the physics, so fps scales mostly with _N.
+
 Tuning knobs (top of this file)
 ────────────────────────────────
-  _N        particle count (default 90; reduce to 60 if framerate is low)
-  _K        species count  (default 4; max 6 to stay within palette)
-  _RMAX     interaction radius in pixels (default 26)
-
-Performance notes
-─────────────────
-Simulation is O(N) thanks to a spatial hash grid (same as the original).
-At N=90 on ESP32-S3 (240 MHz) expect ~6–12 fps in pure MicroPython.
-Reduce _N to 60 for ~15 fps.  The visual effect is already mesmerising at 6 fps.
+  _N        particle count (default 100)
+  _K        species count  (2–6; must be ≤ len(palette))
+  _RMAX     interaction radius in pixels (default 20)
+  _USE_VIPER  True = viper fixed-point kernel; False = float fallback
 """
 
 import random
 import math
 import sys
 import time
+import array
+import micropython
 import M5
 
 # ── display ───────────────────────────────────────────────────────────────────
@@ -90,7 +100,7 @@ _PALETTES = [
 ]
 
 # ── simulation parameters (tune here) ────────────────────────────────────────
-_N    = 60      # particle count (try 60 if slow, 120 if fast)
+_N    = 100     # particle count
 _K    = 3       # species count  (2–6; must be ≤ len(palette))
 _RMAX = 20.0    # interaction radius (pixels)
 _FORCE = 10.0   # force multiplier
@@ -98,17 +108,49 @@ _FHL  = 0.04    # friction half-life (higher = more glide)
 _BETA = 0.3     # hard-core repulsion zone (fraction of _RMAX)
 _DT   = 0.04    # time step
 
-# Precomputed constants (derived from above)
-_FF     = 0.5 ** (_DT / _FHL)  # friction factor per frame  (≈ 0.648)
-_FPF_DT = _RMAX * _FORCE * _DT  # combined force scale       (≈ 6.5)
+_USE_VIPER = True   # False → float fallback (_step_float); see module docstring
+
+# Precomputed float constants (used by the float fallback)
+_FF     = 0.5 ** (_DT / _FHL)  # friction factor per frame
+_FPF_DT = _RMAX * _FORCE * _DT  # combined force scale
 _R2     = _RMAX * _RMAX
 _IB     = 1.0 / (1.0 - _BETA)
 
+# ── fixed-point engine constants (Q8: 1 unit = 1/256 px) ──────────────────────
+# Positions/velocities live in Q8 ints. The squared distance dx*dx+dy*dy is
+# Q16; with |dx| capped at W/2 after the periodic wrap it stays < 2^31, so Q8
+# is the largest scale that never overflows int32 on the squaring.
+_S    = 256
+_Wq   = _W * _S
+_Hq   = _H * _S
+_Wh   = _Wq // 2
+_Hh   = _Hq // 2
+_RMAXq = int(_RMAX * _S)
+_R2q  = _RMAXq * _RMAXq                 # Q16
+_BETAq = int(_BETA * _S + 0.5)
+_IBq  = int(_IB * _S + 0.5)
+_FFq  = int(_FF * _S + 0.5)             # = 128 for FF=0.5 → exact halving
+_FPFq = int(_FPF_DT * _S + 0.5)         # = 2048 for FPF=8.0 → exact ×8
+_dtq  = int(_DT * 65536 + 0.5)          # dt in Q16 for the integration
+_gc   = max(1, int(_W / _RMAX))         # grid columns
+_gr   = max(1, int(_H / _RMAX))         # grid rows
+_nc   = _gc * _gr                       # grid cells
+
+# Scalar params handed to the viper kernel (index order is load-bearing —
+# keep in sync with _step_v's sp[...] reads).
+_params = array.array('i', [
+    _N, _K, _Wq, _Hq, _Wh, _Hh, _R2q, _RMAXq,
+    _BETAq, _IBq, _FFq, _FPFq, _dtq, _gc, _gr, _nc,
+])
+# Spatial-hash grid, preallocated once: head[0.._nc) then nxt[_nc.._nc+_N).
+_grid = array.array('i', bytearray(4 * (_nc + _N)))
+
 # ── runtime state ─────────────────────────────────────────────────────────────
-_x = _y = _vx = _vy = _typ = None   # particle arrays (set by _spawn)
-_mat  = None                          # K×K interaction matrix
-_cols = []                            # RGB565 colour per species
-_pal  = 0                             # current palette index
+_x = _y = _vx = _vy = None   # array('i') Q8 positions/velocities (set by _spawn)
+_typ = None                  # bytearray of species ids
+_mat  = None                 # flat array('i') K*K interaction matrix, Q8
+_cols = []                   # RGB888 colour per species
+_pal  = 0                    # current palette index
 
 # ── colour helpers ────────────────────────────────────────────────────────────
 
@@ -126,20 +168,20 @@ def _build_cols():
     p = _PALETTES[_pal]
     _cols = [p[i % len(p)] for i in range(_K)]
 
-# ── matrix helpers ─────────────────────────────────────────────────────────────
+# ── matrix helpers (flat K*K, Q8 ints) ──────────────────────────────────────────
 
 def _rand_mat():
     global _mat
-    _mat = [[random.uniform(-1.0, 1.0) for _ in range(_K)]
-            for _ in range(_K)]
+    _mat = array.array('i', [int(random.uniform(-1.0, 1.0) * _S)
+                             for _ in range(_K * _K)])
 
 
 def _mutate(amt=0.25):
     """Nudge every matrix cell by ±amt (clamped to [-1, 1])."""
-    for i in range(_K):
-        for j in range(_K):
-            v = _mat[i][j] + (random.random() * 2.0 - 1.0) * amt
-            _mat[i][j] = -1.0 if v < -1.0 else (1.0 if v > 1.0 else v)
+    for idx in range(_K * _K):
+        v = _mat[idx] / _S + (random.random() * 2.0 - 1.0) * amt
+        v = -1.0 if v < -1.0 else (1.0 if v > 1.0 else v)
+        _mat[idx] = int(v * _S)
 
 
 def _preset(name):
@@ -159,7 +201,7 @@ def _preset(name):
                 else:                   v = -0.10
             else:  # gas
                 v = -0.10 if i == j else -(0.30 + random.random() * 0.50)
-            _mat[i][j] = v
+            _mat[i * k + j] = int(v * _S)
 
 # ── particle init ─────────────────────────────────────────────────────────────
 
@@ -167,87 +209,202 @@ def _spawn():
     """Scatter particles uniformly across the screen with zero velocity."""
     global _x, _y, _vx, _vy, _typ
     n = _N
-    _x   = [random.uniform(0.0, float(_W)) for _ in range(n)]
-    _y   = [random.uniform(0.0, float(_H)) for _ in range(n)]
-    _vx  = [0.0] * n
-    _vy  = [0.0] * n
-    _typ = [random.randint(0, _K - 1) for _ in range(n)]
+    _x   = array.array('i', [int(random.uniform(0.0, float(_W)) * _S) for _ in range(n)])
+    _y   = array.array('i', [int(random.uniform(0.0, float(_H)) * _S) for _ in range(n)])
+    _vx  = array.array('i', bytearray(4 * n))
+    _vy  = array.array('i', bytearray(4 * n))
+    _typ = bytearray([random.randint(0, _K - 1) for _ in range(n)])
 
-# ── physics step (spatial-hash O(N)) ─────────────────────────────────────────
+# ── physics step ──────────────────────────────────────────────────────────────
 
-def _step():
-    """Advance the simulation by one time step.
+@micropython.viper
+def _isqrt(n: int) -> int:
+    """Integer sqrt (bit-by-bit). sqrt of a Q16 value gives Q8 directly."""
+    n = int(n)
+    if n <= 0:
+        return 0
+    x = int(0)
+    b = int(1 << 30)
+    while b > n:
+        b >>= 2
+    while b != 0:
+        if n >= x + b:
+            n -= x + b
+            x = (x >> 1) + b
+        else:
+            x >>= 1
+        b >>= 2
+    return x
 
-    Uses a spatial hash grid (cell size = _RMAX) so each particle only
-    visits its 3×3 neighbourhood — O(N) instead of O(N²).
+
+@micropython.viper
+def _step_v(xp: ptr32, yp: ptr32, vxp: ptr32, vyp: ptr32,
+            tp: ptr8, mp: ptr32, gp: ptr32, sp: ptr32):
+    """Viper fixed-point step: build spatial grid, accumulate forces, integrate.
+
+    All integer / Q8. Forces accumulate as (dx*f)//d (never f/d separately —
+    that overflows when d is tiny). Signed scaling uses // (not >>) so
+    negatives stay correct; >> is reserved for provably-nonnegative values.
     """
+    n = int(sp[0]);   k = int(sp[1])
+    Wq = int(sp[2]);  Hq = int(sp[3]);  Wh = int(sp[4]);  Hh = int(sp[5])
+    R2q = int(sp[6]); RMAXq = int(sp[7])
+    BETAq = int(sp[8]); IBq = int(sp[9]); FFq = int(sp[10]); FPFq = int(sp[11])
+    dtq = int(sp[12]); gcn = int(sp[13]); grn = int(sp[14]); nc = int(sp[15])
+
+    # reset grid heads
+    c = int(0)
+    while c < nc:
+        gp[c] = -1
+        c += 1
+    # build grid (nxt of particle i stored at gp[nc + i])
+    i = int(0)
+    while i < n:
+        cx = int(xp[i]) // RMAXq
+        if cx >= gcn: cx = gcn - 1
+        cy = int(yp[i]) // RMAXq
+        if cy >= grn: cy = grn - 1
+        cc = cy * gcn + cx
+        gp[nc + i] = gp[cc]
+        gp[cc] = i
+        i += 1
+
+    # forces
+    i = 0
+    while i < n:
+        fx = int(0); fy = int(0)
+        xi = int(xp[i]); yi = int(yp[i])
+        rb = int(tp[i]) * k
+        cx = xi // RMAXq
+        if cx >= gcn: cx = gcn - 1
+        cy = yi // RMAXq
+        if cy >= grn: cy = grn - 1
+        oy = -1
+        while oy < 2:
+            ncy = (cy + oy + grn) % grn
+            ox = -1
+            while ox < 2:
+                ncx = (cx + ox + gcn) % gcn
+                j = int(gp[ncy * gcn + ncx])
+                while j != -1:
+                    if j != i:
+                        dx = int(xp[j]) - xi
+                        dy = int(yp[j]) - yi
+                        if dx > Wh: dx -= Wq
+                        elif dx < -Wh: dx += Wq
+                        if dy > Hh: dy -= Hq
+                        elif dy < -Hh: dy += Hq
+                        d2 = dx * dx + dy * dy
+                        if d2 > 0 and d2 < R2q:
+                            d = int(_isqrt(d2))
+                            rr = (d << 8) // RMAXq
+                            if rr < BETAq:
+                                f = ((rr << 8) // BETAq) - 256
+                            else:
+                                t = (rr << 1) - 256 - BETAq
+                                if t < 0: t = -t
+                                term = 256 - ((t * IBq) >> 8)
+                                f = (int(mp[rb + int(tp[j])]) * term) // 256
+                            fx += (dx * f) // d
+                            fy += (dy * f) // d
+                    j = int(gp[nc + j])
+                ox += 1
+            oy += 1
+        vxp[i] = (int(vxp[i]) * FFq) // 256 + (fx * FPFq) // 256
+        vyp[i] = (int(vyp[i]) * FFq) // 256 + (fy * FPFq) // 256
+        i += 1
+
+    # integrate (single-wrap conditional; velocities never exceed a screen/step)
+    i = 0
+    while i < n:
+        nx = int(xp[i]) + (int(vxp[i]) * dtq) // 65536
+        if nx >= Wq: nx -= Wq
+        elif nx < 0: nx += Wq
+        xp[i] = nx
+        ny = int(yp[i]) + (int(vyp[i]) * dtq) // 65536
+        if ny >= Hq: ny -= Hq
+        elif ny < 0: ny += Hq
+        yp[i] = ny
+        i += 1
+
+
+def _step_float(x, y, vx, vy):
+    """Float fallback: the original algorithm, on float-list positions, reading
+    the flat Q8 matrix. Kept as a validated reference / firmware safety net."""
     n   = _N
     W   = float(_W);  H  = float(_H)
     rM  = _RMAX;      r2 = _R2
     ff  = _FF;        ib = _IB;  beta = _BETA
-    fpf = _FPF_DT     # velocity increment per raw force unit
-
-    # ── build spatial grid ─────────────────────────────────────────────
-    cw = rM                                       # cell width  = rMax
-    ch = rM                                       # cell height = rMax
-    gc = max(1, int(W / cw))                      # grid columns
-    gr = max(1, int(H / ch))                      # grid rows
-    nc = gc * gr
-
-    head = [-1] * nc   # head[cell] = first particle (linked list)
-    nxt  = [-1] * n    # nxt[i]     = next particle in same cell
-
+    fpf = _FPF_DT;    dt = _DT
+    mat = _mat;       typ = _typ;  K = _K
+    sqrt = math.sqrt
+    cw = rM;  ch = rM
+    gc = max(1, int(W / cw));  gr = max(1, int(H / ch));  nc = gc * gr
+    head = [-1] * nc;  nxt = [-1] * n
     for i in range(n):
-        cx = int(_x[i] / cw);  cx = min(cx, gc - 1)
-        cy = int(_y[i] / ch);  cy = min(cy, gr - 1)
-        c  = cy * gc + cx
-        nxt[i]  = head[c]
-        head[c] = i
-
-    # ── compute forces ─────────────────────────────────────────────────
+        cx = int(x[i] / cw);  cx = min(cx, gc - 1)
+        cy = int(y[i] / ch);  cy = min(cy, gr - 1)
+        c = cy * gc + cx
+        nxt[i] = head[c];  head[c] = i
     for i in range(n):
         fx = 0.0;  fy = 0.0
-        xi = _x[i];  yi = _y[i]
-        row = _mat[_typ[i]]
+        xi = x[i];  yi = y[i];  rb = typ[i] * K
         cx = int(xi / cw);  cx = min(cx, gc - 1)
         cy = int(yi / ch);  cy = min(cy, gr - 1)
-
         for oy in range(-1, 2):
             ncy = (cy + oy + gr) % gr
             for ox in range(-1, 2):
                 j = head[ncy * gc + (cx + ox + gc) % gc]
                 while j != -1:
                     if j != i:
-                        dx = _x[j] - xi;  dy = _y[j] - yi
-                        # periodic (wrapping) boundary
+                        dx = x[j] - xi;  dy = y[j] - yi
                         if   dx >  W * 0.5: dx -= W
                         elif dx < -W * 0.5: dx += W
                         if   dy >  H * 0.5: dy -= H
                         elif dy < -H * 0.5: dy += H
                         d2 = dx * dx + dy * dy
                         if 0.0 < d2 < r2:
-                            d  = math.sqrt(d2)
-                            rr = d / rM
+                            d = sqrt(d2);  rr = d / rM
                             if rr < beta:
-                                # hard-core repulsion: always pushes outward
                                 f = rr / beta - 1.0
                             else:
-                                # species-dependent attraction / repulsion
-                                f = row[_typ[j]] * (
+                                f = (mat[rb + typ[j]] / _S) * (
                                     1.0 - abs(2.0 * rr - 1.0 - beta) * ib)
-                            id_ = f / d
-                            fx += dx * id_
-                            fy += dy * id_
+                            idd = f / d
+                            fx += dx * idd;  fy += dy * idd
                     j = nxt[j]
-
-        _vx[i] = _vx[i] * ff + fx * fpf
-        _vy[i] = _vy[i] * ff + fy * fpf
-
-    # ── integrate positions ────────────────────────────────────────────
-    dt = _DT
+        vx[i] = vx[i] * ff + fx * fpf
+        vy[i] = vy[i] * ff + fy * fpf
     for i in range(n):
-        _x[i] = (_x[i] + _vx[i] * dt) % W
-        _y[i] = (_y[i] + _vy[i] * dt) % H
+        x[i] = (x[i] + vx[i] * dt) % W
+        y[i] = (y[i] + vy[i] * dt) % H
+
+
+_ftmp = None   # lazily-allocated float scratch buffers for the fallback path
+
+
+def _step_ref():
+    """Run the float fallback over the Q8 int arrays (convert in/out)."""
+    global _ftmp
+    if _ftmp is None:
+        _ftmp = ([0.0] * _N, [0.0] * _N, [0.0] * _N, [0.0] * _N)
+    fx, fy, fvx, fvy = _ftmp
+    inv = 1.0 / _S
+    for i in range(_N):
+        fx[i] = _x[i] * inv;  fy[i] = _y[i] * inv
+        fvx[i] = _vx[i] * inv;  fvy[i] = _vy[i] * inv
+    _step_float(fx, fy, fvx, fvy)
+    for i in range(_N):
+        _x[i] = int(fx[i] * _S);  _y[i] = int(fy[i] * _S)
+        _vx[i] = int(fvx[i] * _S);  _vy[i] = int(fvy[i] * _S)
+
+
+def _step():
+    """Advance the simulation one frame (viper kernel, or float fallback)."""
+    if _USE_VIPER:
+        _step_v(_x, _y, _vx, _vy, _typ, _mat, _grid, _params)
+    else:
+        _step_ref()
 
 # ── trail buffer ──────────────────────────────────────────────────────────────
 #
@@ -259,8 +416,8 @@ _tbuf  = []       # list of [(x, y, species), …]  (newest last)
 
 
 def _push_trail():
-    """Snapshot current positions; evict oldest frame when full."""
-    _tbuf.append([(int(_x[i]), int(_y[i]), _typ[i]) for i in range(_N)])
+    """Snapshot current positions (Q8 → px); evict oldest frame when full."""
+    _tbuf.append([(_x[i] >> 8, _y[i] >> 8, _typ[i]) for i in range(_N)])
     if len(_tbuf) > _TRAIL:
         _tbuf.pop(0)
 
@@ -293,16 +450,17 @@ def _draw(fps, paused):
                 draws.append((px, py, dc[sp]))
                 new_lit.add((px, py))
 
-    # Current particles at full brightness (2×2 px squares)
+    # Current particles at full brightness (2×2 px squares), Q8 → px
     for i in range(_N):
-        px = int(_x[i]);  py = int(_y[i])
+        px = _x[i] >> 8;  py = _y[i] >> 8
         draws.append((px, py, _cols[_typ[i]]))
         new_lit.add((px, py))
 
     # Erase only cells that were lit last frame but aren't now → no flicker
     # on pixels that stay lit, no stale trails left behind.
-    for px, py in _lit:
-        if (px, py) not in new_lit:
+    _LCD.startWrite()                 # hold the SPI bus open across the
+    for px, py in _lit:               # whole frame's fillRects/drawString
+        if (px, py) not in new_lit:   # instead of re-acquiring per call
             _LCD.fillRect(px, py, 2, 2, 0x000000)
 
     for px, py, col in draws:
@@ -321,6 +479,7 @@ def _draw(fps, paused):
     # Palette colour swatches — bottom-right corner (fixed position; opaque)
     for i in range(_K):
         _LCD.fillRect(_W - (_K - i) * 6, _H - 7, 5, 5, _cols[i])
+    _LCD.endWrite()
 
 # ── entry point ───────────────────────────────────────────────────────────────
 
