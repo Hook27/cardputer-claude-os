@@ -24,3 +24,10 @@ PI_ENDPOINTS = (
     "",
     "",
 )
+
+# Scanner app — base URL of scanservjs (the SANE web frontend) on the Pi
+# that has the scanner attached. LAN IP, no trailing slash, e.g.
+#   "http://192.168.178.45:8090"
+# The Cardputer reaches it over the local network (not Tailscale), so use
+# the Pi's LAN IP — ideally a DHCP reservation so it never changes.
+SCANNER_BASE = ""
