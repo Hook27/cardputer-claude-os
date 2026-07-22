@@ -94,11 +94,50 @@ def _stub_battery():
 # primary channel; the sound is just a nudge. Called only from the main
 # loop (never BLE-callback context) because tone() blocks for the note
 # duration, and blocking inside the BLE IRQ would starve the controller.
+def _prime_speaker():
+    """Wake the audio power-amp so the *first* confirmation beep is heard.
+
+    The Cardputer's speaker amp is powered down at boot and only enabled
+    when the first tone plays — and the PA power-on ramp swallows the
+    start of that first tone, so in practice the very first beep of a
+    session is inaudible while every later one is fine. We fix that by
+    enabling the PA and playing one silent (volume 0) priming tone during
+    app init, so the amp is already up and stable by the time a real
+    prompt arrives. All guarded — a build without setPA/setVolume just
+    skips the prime and behaves as before. `getVolume` on this UIFlow
+    build reports 48 as the resting level; the real beep sets its own
+    volume each time so the 0 we leave here doesn't mute later tones.
+    """
+    try:
+        spk = M5.Speaker
+    except Exception:
+        return
+    try:
+        spk.setPA(True)
+    except Exception:
+        pass
+    try:
+        spk.setVolume(0)
+        spk.tone(2000, 30)
+        time.sleep_ms(40)
+    except Exception as e:
+        print("claude_buddy: speaker prime skipped:", e)
+
+
 def _beep_confirm():
     try:
         spk = M5.Speaker
     except Exception:
         return
+    # Turn the chirp right down. The probe showed this build's resting
+    # volume is 48/255 and that setVolume genuinely scales loudness, so
+    # 20 lands clearly below the default — a subtle nudge, not a chime.
+    # Guarded on its own so a build without setVolume still gets the tone
+    # (at its default loudness) rather than falling through silent.
+    try:
+        spk.setVolume(20)
+    except Exception:
+        pass
     try:
         spk.tone(1175, 90)
         time.sleep_ms(70)
@@ -211,6 +250,9 @@ def run():
 
     ui = buddy_ui.BuddyUI()
     print("claude_buddy: ui ready")
+    # Warm the audio amp now so the first prompt's chirp isn't eaten by
+    # the PA power-on ramp (see _prime_speaker). Silent, and cheap.
+    _prime_speaker()
     state = buddy_state.BuddyState()
     print("claude_buddy: state ready")
     ui.update_identity(state.name, state.owner)
