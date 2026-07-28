@@ -3,8 +3,14 @@
 # Cardputer ze kan tonen zonder zelf een token te dragen.
 Description=Claude verbruikserver voor de Cardputer
 Documentation=https://github.com/Hook27/cardputer-claude-os
-# network-online (niet alleen network.target): we willen pas starten als er
-# echt routeerbaar netwerk is, anders faalt de eerste API-call onnodig.
+# Let op: dit is een *user*-unit, en network-online.target is een systeemtarget
+# dat de user-manager niet kent — deze twee regels doen hier vermoedelijk niets.
+# Ze staan er voor het geval iemand hier een systeem-unit van maakt, en ze zijn
+# onschadelijk. Wachten op netwerk is ook niet nodig gebleken: binden op
+# 0.0.0.0 lukt zonder netwerk, en een mislukte eerste ophaalpoging degradeert
+# netjes (bron wordt "fout"/"geen-token") en wordt binnen de cachetijd vanzelf
+# opnieuw geprobeerd. Bij een reboot-test op TaSc-Pi5 stond de live data zes
+# seconden na de start van de unit al klaar.
 After=network-online.target
 Wants=network-online.target
 
