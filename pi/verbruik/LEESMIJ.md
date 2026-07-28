@@ -73,13 +73,122 @@ New-NetFirewallRule -DisplayName "Claude verbruik 8091" -Direction Inbound `
   -Protocol TCP -LocalPort 8091 -Action Allow -Profile Any -RemoteAddress LocalSubnet
 ```
 
-## Fase 1 — de echte server op de Pi
+## Fase 1 — de echte server op de Pi (TaSc-Pi5)
 
-Nog te bouwen: `claude_verbruik_server.py` (systemd-service) plus een
-Linux-tegenhanger van `ververs-claude-token.ps1` als systemd-timer. De Pi
-krijgt daarvoor een **eigen** Claude Code-login; de limieten zijn
-accountbreed, dus de cijfers zijn dezelfde als op de laptop.
+De Pi krijgt een **eigen** Claude Code-login. De limieten zijn accountbreed,
+dus de cijfers zijn dezelfde als op de laptop. Kopieer nooit credentials
+tussen machines — laat elke machine zelf inloggen.
 
-Let op het onderhoud dat daarbij hoort: het refresh-token is ~30 dagen
-houdbaar vanaf de laatste login en schuift niet mee met refreshes, dus
-ongeveer maandelijks is een handmatige `claude auth login` op de Pi nodig.
+Bestanden:
+
+| bestand | rol |
+|---|---|
+| `claude_verbruik_server.py` | haalt op + serveert `:8091/verbruik` |
+| `ververs-claude-token.py` | houdt het token geldig (Linux-port van de `.ps1`) |
+| `test-ververs-claude-token.py` | offline test met nep-credentials |
+| `systemd/*.service`, `*.timer` | user-units voor beide |
+
+### Stap 0 — kan Claude Code hier draaien?
+
+Eerst vaststellen, niet aannemen (de Pi is ARM64):
+
+```bash
+uname -m && python3 --version && (command -v claude && claude --version || echo "claude nog niet geinstalleerd")
+```
+
+### Stap 1 — Claude Code + login
+
+Installeer de CLI en log eenmalig in:
+
+```bash
+claude auth login
+```
+
+Controleer daarna dat het credentialsbestand er is:
+
+```bash
+python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.claude/.credentials.json')));o=d['claudeAiOauth'];print('token aanwezig:',bool(o.get('accessToken')),'| verloopt:',o.get('expiresAt'))"
+```
+
+### Stap 2 — bestanden neerzetten
+
+```bash
+mkdir -p ~/claude-verbruik && cd ~/claude-verbruik
+# kopieer hierheen: claude_verbruik_server.py, ververs-claude-token.py,
+# test-ververs-claude-token.py
+```
+
+### Stap 3 — eerst testen, dan pas aanzetten
+
+De offline test raakt je echte token niet aan (nep-credentials, nep-CLI,
+geen netwerk) en lokt juist de gevaarlijke paden uit: pogingenlimiet,
+leeggemaakte login, verlopen refresh-token.
+
+```bash
+python3 ~/claude-verbruik/test-ververs-claude-token.py
+```
+
+Verwacht: `13 goed, 0 fout`. Daarna één echte, ongevaarlijke controle —
+`--dry-run` bepaalt wel de actie maar start de CLI niet:
+
+```bash
+python3 ~/claude-verbruik/ververs-claude-token.py --dry-run
+```
+
+En de server één keer handmatig (`--eenmalig` haalt op, toont en stopt):
+
+```bash
+python3 ~/claude-verbruik/claude_verbruik_server.py --eenmalig
+```
+
+Verwacht `"bron": "live"` met je echte percentages. Staat er `geen-token`,
+dan is de login nog niet gelukt.
+
+### Stap 4 — units installeren
+
+```bash
+mkdir -p ~/.config/systemd/user
+# kopieer systemd/claude-verbruik.service, claude-token-ververs.service
+# en claude-token-ververs.timer naar ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now claude-verbruik.service
+systemctl --user enable --now claude-token-ververs.timer
+```
+
+User-units draaien normaal alleen tijdens een sessie. Zodat ze ook draaien
+als je niet ingelogd bent (dat is het hele punt van een always-on Pi):
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+Controleren:
+
+```bash
+systemctl --user status claude-verbruik.service --no-pager
+systemctl --user list-timers claude-token-ververs.timer --no-pager
+curl -s http://localhost:8091/verbruik
+```
+
+### Stap 5 — de Cardputer erop richten
+
+Zet in `buddy/device/apps/config.py`:
+
+```python
+VERBRUIK_ENDPOINT = "http://192.168.178.234:8091/verbruik"
+```
+
+en push `config.py` naar het toestel.
+
+### Onderhoud
+
+- Het refresh-token is ~30 dagen houdbaar **vanaf de laatste login** en
+  schuift niet mee met refreshes. Ongeveer maandelijks is dus een
+  handmatige `claude auth login` op de Pi nodig.
+- Wat de timer deed staat in
+  `~/.local/state/claude-token-refresh/ververs-claude-token.log`.
+  Zie je daar `Nodig: claude auth login`, dan is dat het signaal.
+- Diagnose per poging (CLI-debuglogs, momentopnames met vingerafdrukken —
+  geen tokens) staat in `~/.local/state/claude-token-refresh/diagnose/`.
+- `exit 1` van de refresh-unit is normaal: het script gebruikt die code ook
+  voor "gepauzeerd" en "login-nodig". Vandaar `SuccessExitStatus=0 1`.

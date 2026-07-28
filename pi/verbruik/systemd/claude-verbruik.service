@@ -1,0 +1,25 @@
+[Unit]
+# Verbruikserver: serveert de Claude-limieten kaal op het LAN, zodat de
+# Cardputer ze kan tonen zonder zelf een token te dragen.
+Description=Claude verbruikserver voor de Cardputer
+Documentation=https://github.com/Hook27/cardputer-claude-os
+# network-online (niet alleen network.target): we willen pas starten als er
+# echt routeerbaar netwerk is, anders faalt de eerste API-call onnodig.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/claude-verbruik/claude_verbruik_server.py --poort 8091
+# De server is read-only op de credentials en kan zonder verlies herstart
+# worden; opnieuw proberen is dus altijd goed. 10 s zodat een Pi die net
+# opstart niet in een snelle herstartlus komt.
+Restart=on-failure
+RestartSec=10
+# Bescheiden afscherming. Dit is een user-unit, dus de zwaardere opties
+# (ProtectSystem=strict e.d.) doen hier weinig; deze twee werken wel.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

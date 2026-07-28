@@ -1,0 +1,19 @@
+[Unit]
+Description=Kwartiercheck op het Claude Code OAuth-token
+Documentation=https://github.com/Hook27/cardputer-claude-os
+
+[Timer]
+# Na de boot even wachten tot netwerk en tijd kloppen; een refresh met een
+# nog niet gesynchroniseerde klok zou de expiry verkeerd inschatten.
+OnBootSec=3min
+# Elk kwartier. Het token loopt 8 uur, de marge is 4 minuten, dus een
+# kwartierritme raakt het venster ruim op tijd. Vaker pollen levert niets
+# op: de CLI ververst toch pas binnen 5 minuten voor de expiry.
+OnUnitActiveSec=15min
+AccuracySec=1min
+# Stond de Pi uit toen een check had moeten draaien, dan die na het
+# opstarten alsnog inhalen.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

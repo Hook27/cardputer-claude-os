@@ -1,0 +1,16 @@
+[Unit]
+# Houdt het Claude Code-token geldig. Bijna elke run doet niets: het script
+# leest alleen het JSON-bestand en stopt weer. Alleen vlak voor de expiry
+# start het de CLI met een lege prompt.
+Description=Ververs het Claude Code OAuth-token indien nodig
+Documentation=https://github.com/Hook27/cardputer-claude-os
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/claude-verbruik/ververs-claude-token.py
+# Exit 1 is hier een NORMALE uitkomst: het script gebruikt die code ook voor
+# "mislukt", "gepauzeerd" en "login-nodig" — toestanden waarin het bewust
+# niets meer probeert. Zonder deze regel zou de unit permanent op "failed"
+# staan terwijl er niets stuk is. Wat er werkelijk gebeurde staat in
+# ~/.local/state/claude-token-refresh/ververs-claude-token.log
+SuccessExitStatus=0 1

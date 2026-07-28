@@ -1,0 +1,321 @@
+"""Verbruikserver — serveert je Claude-limieten kaal op het LAN.
+
+Draait op de machine die de Claude Code-login heeft (bij Jörg: TaSc-Pi5),
+leest daar het token en vraagt de actuele limietstand op bij Anthropic.
+De Cardputer-app `claude_verbruik` pollt dit endpoint; die draagt zelf
+géén token en praat niet met api.anthropic.com.
+
+    GET /verbruik  ->  {"five_hour": 42.0, "seven_day": 18.0,
+                        "fh_reset_in_s": 4680, "sd_reset_in_s": 275000,
+                        "bron": "live", "ts": 1785261682}
+
+### Wat dit script wel en niet doet
+
+WEL   het token uit ~/.claude/.credentials.json lezen (platte tekst, door
+      Claude Code zelf geschreven — geen ontsleuteling van een kluis) en
+      daarmee GET /api/oauth/usage aanroepen.
+NIET  het token verversen. Dat roteert het refresh-token en kan de login
+      slopen; het hoort thuis in `ververs-claude-token.py`, dat als eigen
+      systemd-timer draait. Deze server is read-only op de credentials.
+NIET  het token uitserveren of loggen. Alleen percentages gaan het net op.
+
+### Resettijd als seconden, niet als datum
+
+De API geeft `resets_at` als ISO-tijdstip. Wij rekenen dat hier om naar
+**seconden vanaf nu**, zodat de Cardputer geen ISO hoeft te parseren en
+zijn eigen klok (die van NTP komt en er soms naast zit) er niet toe doet.
+Het toestel telt lokaal verder af tussen twee polls.
+
+### Cache
+
+De API heeft een eigen request-limiet, dus we halen hoogstens elke
+CACHE_S seconden verse cijfers op; alle pollende clients binnen dat
+venster krijgen dezelfde waarden. Het toestel pollt elke 45 s, wat dus
+ruim binnen de cache valt — precies de bedoeling.
+
+### Terugval
+
+Anders dan de laptop-widget is er hier GEEN tweede bron: de lokale cache
+van de Claude-desktopapp (`plan-usage-history.json`) bestaat alleen op
+Windows. Lukt het ophalen niet, dan serveren we de laatst bekende cijfers
+met een afwijkende `bron`, zodat het toestel kan tonen dat het om oude
+gegevens gaat. Vlak na een herstart zonder geldig token is er niets te
+tonen en blijven de velden leeg (het toestel toont dan "--").
+
+Gebruik:
+
+    python3 claude_verbruik_server.py                 # 0.0.0.0:8091
+    python3 claude_verbruik_server.py --poort 9000
+    python3 claude_verbruik_server.py --eenmalig      # 1x ophalen en tonen
+"""
+
+import argparse
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# Zelfde headers als de Claude Code CLI; zonder de beta-header antwoordt
+# het endpoint niet. De User-Agent houden we gelijk aan wat de widget op
+# de laptop stuurt.
+UA = "claude-code/2.1.217"
+BETA = "oauth-2025-04-20"
+
+CACHE_S = 90          # niet vaker dan dit bij Anthropic langs
+HTTP_TIMEOUT_S = 10
+
+_CRED_PAD = os.path.expanduser("~/.claude/.credentials.json")
+
+
+def _log(*args):
+    """Regel naar stdout met tijdstempel; systemd vangt dit op in de journal.
+
+    Bewust geen token, geen headers en geen ruwe response — alleen wat je
+    nodig hebt om te zien of het werkt.
+    """
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), *args, flush=True)
+
+
+# ---- token ----------------------------------------------------------
+
+
+def _lees_token(pad):
+    """Access-token uit het credentialsbestand, of None.
+
+    Geeft ook expiresAt terug zodat we een verlopen token kunnen melden
+    zonder er eerst een mislukte API-call tegenaan te gooien.
+    """
+    try:
+        with open(pad, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, None, "geen credentialsbestand"
+    except (OSError, ValueError) as e:
+        return None, None, "credentials onleesbaar: {}".format(e)
+    oauth = (data or {}).get("claudeAiOauth") or {}
+    token = oauth.get("accessToken")
+    expires = oauth.get("expiresAt")
+    if not token:
+        return None, expires, "geen accessToken (log in met: claude auth login)"
+    return token, expires, None
+
+
+# ---- API ------------------------------------------------------------
+
+
+def _naar_epoch(waarde):
+    """ISO-tijdstip of epoch -> epoch-seconden (float), of None.
+
+    `resets_at` komt als ISO 8601 binnen, meestal met een 'Z'. Oudere
+    Python-versies struikelen over die Z in fromisoformat, dus die
+    vervangen we zelf. Een kaal getal accepteren we ook, voor het geval
+    het formaat ooit verandert.
+    """
+    if waarde is None:
+        return None
+    if isinstance(waarde, (int, float)):
+        return float(waarde)
+    tekst = str(waarde).strip()
+    if not tekst:
+        return None
+    try:
+        return float(tekst)
+    except ValueError:
+        pass
+    try:
+        if tekst.endswith("Z"):
+            tekst = tekst[:-1] + "+00:00"
+        dt = datetime.fromisoformat(tekst)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _resterend(waarde):
+    """Seconden tot `waarde`, afgerond, nooit negatief. None blijft None."""
+    epoch = _naar_epoch(waarde)
+    if epoch is None:
+        return None
+    return max(int(epoch - time.time()), 0)
+
+
+def _haal_verbruik(token):
+    """Roep het usage-endpoint aan. ``(stand, None)`` of ``(None, fout)``.
+
+    `utilization` is al een percentage (0-100) — zo gebruikt de widget op
+    de laptop het ook, dus we schalen niets.
+    """
+    req = urllib.request.Request(USAGE_URL, method="GET")
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("anthropic-beta", BETA)
+    req.add_header("User-Agent", UA)
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+            ruw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            # Verlopen of ingetrokken token. Niet zelf verversen — dat is
+            # het werk van ververs-claude-token.py.
+            return None, "geen-token"
+        return None, "http {}".format(e.code)
+    except (urllib.error.URLError, OSError) as e:
+        return None, "netwerk: {}".format(e)
+
+    try:
+        data = json.loads(ruw)
+        vh = data.get("five_hour") or {}
+        wk = data.get("seven_day") or {}
+        return {
+            "five_hour": float(vh.get("utilization")),
+            "seven_day": float(wk.get("utilization")),
+            "fh_reset_in_s": _resterend(vh.get("resets_at")),
+            "sd_reset_in_s": _resterend(wk.get("resets_at")),
+        }, None
+    except (ValueError, TypeError, AttributeError) as e:
+        return None, "antwoord onbegrijpelijk: {}".format(e)
+
+
+# ---- cache ----------------------------------------------------------
+
+
+class Verbruik:
+    """Haalt op met een cache en onthoudt de laatst gelukte stand.
+
+    De laatst bekende cijfers blijven staan als het ophalen faalt; dan
+    verandert alleen `bron`, zodat het toestel oude gegevens als oud kan
+    tonen in plaats van leeg te vallen.
+    """
+
+    def __init__(self, cred_pad=_CRED_PAD, cache_s=CACHE_S):
+        self.cred_pad = cred_pad
+        self.cache_s = cache_s
+        self._slot = threading.Lock()
+        self._stand = None       # laatste gelukte meting
+        self._stand_ts = 0.0     # wanneer die gemeten is
+        self._laatste_poging = 0.0
+        self._bron = "geen-data"
+
+    def stand(self):
+        with self._slot:
+            nu = time.time()
+            if nu - self._laatste_poging >= self.cache_s:
+                self._laatste_poging = nu
+                self._verzamel()
+            return self._payload()
+
+    def _verzamel(self):
+        token, _expires, fout = _lees_token(self.cred_pad)
+        if token is None:
+            if self._bron != "geen-token":
+                _log("token niet bruikbaar:", fout)
+            self._bron = "geen-token"
+            return
+        stand, fout = _haal_verbruik(token)
+        if stand is None:
+            if self._bron != fout:
+                _log("ophalen mislukt:", fout)
+            self._bron = fout if fout == "geen-token" else "fout"
+            return
+        if self._bron != "live":
+            _log("live cijfers opgehaald")
+        self._stand = stand
+        self._stand_ts = time.time()
+        self._bron = "live"
+
+    def _payload(self):
+        if self._stand is None:
+            # Nog nooit iets gelukt: lege velden, het toestel toont "--".
+            return {
+                "five_hour": None, "seven_day": None,
+                "fh_reset_in_s": None, "sd_reset_in_s": None,
+                "bron": self._bron, "ts": int(time.time()),
+            }
+        # De aftelling is gemeten op _stand_ts; corrigeer voor de tijd die
+        # sindsdien verstreken is, anders loopt de klok op het toestel na
+        # bij een cache-hit.
+        verstreken = int(time.time() - self._stand_ts)
+
+        def rest(v):
+            return None if v is None else max(v - verstreken, 0)
+
+        return {
+            "five_hour": self._stand["five_hour"],
+            "seven_day": self._stand["seven_day"],
+            "fh_reset_in_s": rest(self._stand["fh_reset_in_s"]),
+            "sd_reset_in_s": rest(self._stand["sd_reset_in_s"]),
+            # "live" alleen als de laatste poging ook echt lukte; anders
+            # "gemeten" (oude cijfers) of "geen-token".
+            "bron": self._bron if self._bron != "fout" else "gemeten",
+            "ts": int(self._stand_ts),
+        }
+
+
+# ---- HTTP -----------------------------------------------------------
+
+
+def _maak_handler(verbruik):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return  # de journal is al gevuld door _log
+
+        def do_GET(self):
+            pad = self.path.split("?")[0].rstrip("/") or "/"
+            if pad not in ("/verbruik", "/"):
+                self.send_error(404, "alleen /verbruik")
+                return
+            body = json.dumps(verbruik.stand()).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+    return Handler
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--poort", type=int, default=8091)
+    p.add_argument("--adres", default="0.0.0.0",
+                   help="bindadres; 0.0.0.0 = bereikbaar vanaf het LAN")
+    p.add_argument("--credentials", default=_CRED_PAD)
+    p.add_argument("--cache", type=int, default=CACHE_S,
+                   help="seconden tussen twee API-calls")
+    p.add_argument("--eenmalig", action="store_true",
+                   help="1x ophalen, tonen en stoppen (voor een snelle test)")
+    args = p.parse_args()
+
+    verbruik = Verbruik(cred_pad=args.credentials, cache_s=args.cache)
+
+    if args.eenmalig:
+        print(json.dumps(verbruik.stand(), indent=2))
+        # Exitcode zegt of het echt live was, zodat een testscript erop
+        # kan sturen zonder de JSON te parsen.
+        return 0 if verbruik._bron == "live" else 1
+
+    server = ThreadingHTTPServer((args.adres, args.poort), _maak_handler(verbruik))
+    _log("verbruikserver op http://{}:{}/verbruik (cache {}s)".format(
+        args.adres, args.poort, args.cache))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        _log("gestopt")
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

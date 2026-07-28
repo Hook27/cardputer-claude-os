@@ -1,0 +1,458 @@
+"""Houdt het Claude Code OAuth-token in ~/.claude/.credentials.json geldig.
+
+Linux-port van `ververs-claude-token.ps1` (Windows/SP6). Zelfde logica,
+zelfde resultaatcodes, zelfde veiligheidskleppen — alleen de paden en het
+starten van de CLI verschillen. Bedoeld als systemd-timer op de Pi die de
+verbruikserver draait.
+
+### Waarom dit nodig is
+
+Het access-token verloopt 8 uur na de laatste refresh, en de CLI ververst
+het alleen als het binnen 5 minuten verloopt (of al verlopen is). Blind om
+de 8 uur iets starten helpt dus niet. Dit script kijkt spotgoedkoop of een
+refresh nodig is (leest alleen het JSON-bestand) en start alleen dan de
+CLI met een lege prompt:
+
+    claude -p --no-session-persistence     (met lege stdin)
+
+Die lege prompt doorloopt de volledige startup-init — en die roept de
+refresh-functie aan vóór elke API-call — maar doet GEEN model-call.
+Gevolg: geen tokenverbruik, geen nieuw 5-uursvenster, geen transcript.
+
+De CLI eindigt daarbij met exit 1 en "No messages returned from query".
+Dat is verwacht en zegt NIETS over de auth-status: bij een leeggemaakte
+login is de uitkomst exact hetzelfde. Of het gelukt is blijkt alleen uit
+een opgeschoven `expiresAt`; wát er misging, uit de diagnosebestanden.
+
+Het verversen zelf doet altijd de CLI, nooit dit script.
+
+### Veiligheidskleppen (na de mislukking van 2026-07-26)
+
+Toen weigerde de server het refresh-token, bleef het script het elk
+kwartier opnieuw proberen, en maakte de CLI uiteindelijk de login leeg.
+Daarom:
+
+  - hoogstens MAX_POGINGEN pogingen per expiry-venster; daarna pauzeert
+    het script tot er een nieuw token of een nieuwe login is;
+  - elke poging schrijft een CLI-debuglog (laatste 5 blijven bewaard);
+  - vóór en ná elke poging gaat er een momentopname naar
+    momentopnames.jsonl met tijden en VINGERAFDRUKKEN van de tokens —
+    geen tokens zelf — zodat te zien is of iets anders het token heeft
+    geroteerd;
+  - na een mislukte poging bepaalt `claude auth status --json` of de
+    login nog staat; dat is het enige betrouwbare signaal.
+
+### Resultaat
+
+Laatste regel op stdout is "RESULTAAT: <code>":
+
+    geldig        token nog ruim geldig, niets gedaan            (exit 0)
+    refresh-nodig refresh nodig, CLI niet gestart wegens --dry-run (exit 0)
+    ververst      refresh gelukt, nieuwe expiry weggeschreven    (exit 0)
+    mislukt       CLI gedraaid maar expiry niet opgeschoven      (exit 1)
+    gepauzeerd    pogingenlimiet voor dit venster bereikt        (exit 1)
+    login-nodig   login weg of geweigerd: claude auth login      (exit 1)
+    fout          credentialsbestand ontbreekt of is onleesbaar  (exit 1)
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+# Standaardwaarden; alle paden zijn met vlaggen te overschrijven voor tests.
+MARGE_MINUTEN = 4      # bewust NET binnen de 5 min die de CLI zelf aanhoudt
+MAX_POGINGEN = 2
+TIMEOUT_S = 120
+MAX_LOG_BYTES = 200 * 1024
+WAARSCHUW_DAGEN = 2
+BEWAAR_DEBUG = 5
+
+_HOME = os.path.expanduser("~")
+_CRED_PAD = os.path.join(_HOME, ".claude", ".credentials.json")
+# Bewust in de XDG-state-map: buiten elke cloudmap, en het overleeft een
+# reboot (anders dan /tmp), wat nodig is voor de pogingenteller.
+_STAAT_MAP = os.path.join(
+    os.environ.get("XDG_STATE_HOME", os.path.join(_HOME, ".local", "state")),
+    "claude-token-refresh")
+
+
+class Ctx:
+    """Bundelt de paden zodat de testvariant ze in één keer kan omzetten."""
+
+    def __init__(self, cred, staat_map, claude=None):
+        self.cred = cred
+        self.staat_map = staat_map
+        self.diagnose = os.path.join(staat_map, "diagnose")
+        self.log = os.path.join(staat_map, "ververs-claude-token.log")
+        self.status = os.path.join(staat_map, "ververs-status.json")
+        self.werkmap = os.path.join(staat_map, "werkmap")
+        self.claude = claude
+
+
+# --- logboek ----------------------------------------------------------
+
+
+def schrijf_log(ctx, niveau, bericht):
+    regel = "{} [{}] {}".format(
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), niveau, bericht)
+    try:
+        os.makedirs(ctx.staat_map, exist_ok=True)
+        if os.path.exists(ctx.log) and os.path.getsize(ctx.log) > MAX_LOG_BYTES:
+            oud = ctx.log + ".1"
+            if os.path.exists(oud):
+                os.remove(oud)
+            os.replace(ctx.log, oud)
+        with open(ctx.log, "a", encoding="utf-8") as f:
+            f.write(regel + "\n")
+    except OSError:
+        pass  # loggen mag de refresh nooit blokkeren
+    print(regel, file=sys.stderr)
+
+
+def heartbeat_nodig(ctx):
+    """Hoogstens 1x per uur een 'alles in orde'-regel.
+
+    Zonder deze rem staan er 96 identieke OK-regels per dag in de log en
+    zie je de interessante regels niet meer staan.
+    """
+    try:
+        with open(ctx.log, "r", encoding="utf-8") as f:
+            regels = f.readlines()
+    except OSError:
+        return True
+    for regel in reversed(regels):
+        m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[OK\]", regel)
+        if m:
+            try:
+                t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return True
+            return (datetime.now() - t).total_seconds() >= 3600
+        if regel.strip():
+            return True
+    return True
+
+
+def stop_met(code, exitcode=0):
+    print("RESULTAAT: " + code)
+    sys.exit(exitcode)
+
+
+# --- credentials ------------------------------------------------------
+
+
+def lees_oauth(pad):
+    with open(pad, "r", encoding="utf-8") as f:
+        return (json.load(f) or {}).get("claudeAiOauth")
+
+
+def vingerafdruk(waarde):
+    """Korte SHA-256: genoeg om een tokenwissel te zien, zonder het token
+    zelf ergens vast te leggen."""
+    if not waarde:
+        return "(leeg)"
+    return hashlib.sha256(waarde.encode("utf-8")).hexdigest()[:12]
+
+
+def schrijf_momentopname(ctx, oauth, fase, pogingnaam):
+    try:
+        os.makedirs(ctx.diagnose, exist_ok=True)
+        regel = {
+            "tijd": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "poging": pogingnaam,
+            "fase": fase,
+            "expiresAt": oauth.get("expiresAt") if oauth else None,
+            "refreshTokenExpiresAt": oauth.get("refreshTokenExpiresAt") if oauth else None,
+            "accessTokenVa": vingerafdruk(oauth.get("accessToken")) if oauth else "(geen bestand)",
+            "refreshTokenVa": vingerafdruk(oauth.get("refreshToken")) if oauth else "(geen bestand)",
+        }
+        with open(os.path.join(ctx.diagnose, "momentopnames.jsonl"), "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps(regel) + "\n")
+    except OSError:
+        pass
+
+
+def ruim_debuglogs_op(ctx):
+    try:
+        bestanden = [os.path.join(ctx.diagnose, n)
+                     for n in os.listdir(ctx.diagnose)
+                     if n.startswith("cli-") and n.endswith(".log")]
+        bestanden.sort(key=os.path.getmtime, reverse=True)
+        for pad in bestanden[BEWAAR_DEBUG:]:
+            os.remove(pad)
+    except OSError:
+        pass
+
+
+_DEBUG_PATROON = re.compile(
+    r"oauth|invalid_grant|refresh_token|refresh token|token refresh|\b401\b|"
+    r"\b403\b|Unauthorized|Forbidden|not logged in|credentials\.json|"
+    r"claudeai-mcp|\[Bootstrap\]|Authorization", re.IGNORECASE)
+
+
+def debug_hoogtepunten(pad):
+    """Regels uit het CLI-debuglog die iets over auth zeggen.
+
+    De eigen mapnaam wordt eerst weggestreept: "claude-token-refresh"
+    bevat het woord refresh en zou anders elke padregel laten meeliften.
+    """
+    try:
+        with open(pad, "r", encoding="utf-8", errors="replace") as f:
+            regels = f.readlines()
+    except OSError:
+        return []
+    treffers = []
+    for regel in regels:
+        kaal = regel.replace("claude-token-refresh", "")
+        if _DEBUG_PATROON.search(kaal):
+            treffers.append(re.sub(r"\s+", " ", regel.strip())[:180])
+    return treffers[-6:]
+
+
+# --- pogingenteller ---------------------------------------------------
+
+
+def lees_status(ctx):
+    try:
+        with open(ctx.status, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def schrijf_status(ctx, venster, pogingen):
+    try:
+        os.makedirs(ctx.staat_map, exist_ok=True)
+        with open(ctx.status, "w", encoding="utf-8") as f:
+            json.dump({"venster": venster, "pogingen": pogingen,
+                       "bijgewerkt": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
+    except OSError:
+        pass
+
+
+# --- CLI --------------------------------------------------------------
+
+
+def vind_claude(expliciet=None):
+    if expliciet:
+        return expliciet if os.path.exists(expliciet) else None
+    gevonden = shutil.which("claude")
+    if gevonden:
+        return gevonden
+    for kandidaat in (
+        os.path.join(_HOME, ".local", "bin", "claude"),
+        os.path.join(_HOME, ".npm-global", "bin", "claude"),
+        "/usr/local/bin/claude",
+        "/usr/bin/claude",
+    ):
+        if os.path.exists(kandidaat):
+            return kandidaat
+    return None
+
+
+def is_ingelogd(exe, werkmap):
+    """True/False, of None als het niet vast te stellen was.
+
+    `claude auth status --json` leest alleen lokale state (ververst dus
+    niets) en is het enige betrouwbare signaal of de login nog staat.
+    """
+    try:
+        r = subprocess.run([exe, "auth", "status", "--json"],
+                           cwd=werkmap, capture_output=True, timeout=60)
+        if not r.stdout:
+            return None
+        return bool(json.loads(r.stdout.decode("utf-8", "replace")).get("loggedIn"))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def duur(minuten):
+    if minuten < 0:
+        return "{:.0f} min geleden verlopen".format(abs(minuten))
+    if minuten < 90:
+        return "nog {:.0f} min geldig".format(minuten)
+    return "nog {:.1f} uur geldig".format(minuten / 60)
+
+
+def klok(ms):
+    return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+
+
+# --- hoofdstroom ------------------------------------------------------
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--marge", type=int, default=MARGE_MINUTEN,
+                   help="ververs zodra het token nog minder dan dit aantal minuten geldig is")
+    p.add_argument("--max-pogingen", type=int, default=MAX_POGINGEN)
+    p.add_argument("--dry-run", action="store_true",
+                   help="bepaal wel de actie, start de CLI niet")
+    p.add_argument("--credentials", default=_CRED_PAD)
+    p.add_argument("--staat-map", default=_STAAT_MAP)
+    p.add_argument("--claude", default=None, help="pad naar de claude-binary")
+    p.add_argument("--timeout", type=int, default=TIMEOUT_S)
+    args = p.parse_args()
+
+    ctx = Ctx(args.credentials, args.staat_map, args.claude)
+
+    # --- 1. Credentials inlezen ---------------------------------------
+    if not os.path.exists(ctx.cred):
+        schrijf_log(ctx, "FOUT", "Credentialsbestand niet gevonden: {} -- log "
+                    "eenmalig in met: claude auth login".format(ctx.cred))
+        stop_met("fout", 1)
+    try:
+        oauth = lees_oauth(ctx.cred)
+    except (OSError, ValueError) as e:
+        schrijf_log(ctx, "FOUT", "Kan credentialsbestand niet lezen of parsen: {}".format(e))
+        stop_met("fout", 1)
+    if not oauth or oauth.get("expiresAt") is None:
+        schrijf_log(ctx, "FOUT", "Geen claudeAiOauth/expiresAt in {} -- log "
+                    "eenmalig in met: claude auth login".format(ctx.cred))
+        stop_met("fout", 1)
+
+    nu_ms = int(time.time() * 1000)
+    expires_at = int(oauth["expiresAt"])
+    resterend_min = (expires_at - nu_ms) / 60000.0
+
+    rt_ms = oauth.get("refreshTokenExpiresAt")
+    rt_ms = int(rt_ms) if rt_ms else None
+    rt_dagen = (rt_ms - nu_ms) / 86400000.0 if rt_ms else None
+
+    # Puur informatief: dit veld bleek geen betrouwbare voorspeller — op
+    # 2026-07-26 was het token al geweigerd terwijl hier nog acht dagen stond.
+    if rt_dagen is not None and 0 < rt_dagen < WAARSCHUW_DAGEN:
+        schrijf_log(ctx, "WAARSCHUWING", "Refresh-token verloopt volgens het "
+                    "bestand over {:.1f} dag(en) ({}).".format(rt_dagen, klok(rt_ms)))
+
+    # --- 2. Is een refresh nodig? -------------------------------------
+    if resterend_min > args.marge:
+        if heartbeat_nodig(ctx):
+            schrijf_log(ctx, "OK", "Token {} (tot {}); niets te doen.".format(
+                duur(resterend_min), klok(expires_at)))
+        stop_met("geldig", 0)
+
+    # --- 3. Kan de CLI überhaupt verversen? ---------------------------
+    if not oauth.get("refreshToken"):
+        schrijf_log(ctx, "FOUT", "Geen refresh-token aanwezig (login is "
+                    "leeggemaakt). Nodig: claude auth login")
+        stop_met("login-nodig", 1)
+    if rt_ms is not None and rt_ms <= nu_ms:
+        schrijf_log(ctx, "FOUT", "Refresh-token is verlopen op {}. Nodig: "
+                    "claude auth login".format(klok(rt_ms)))
+        stop_met("login-nodig", 1)
+
+    # --- 4. Pogingenlimiet voor dit expiry-venster --------------------
+    status = lees_status(ctx)
+    al_geprobeerd = 0
+    if status and int(status.get("venster", -1)) == expires_at:
+        al_geprobeerd = int(status.get("pogingen", 0))
+
+    if al_geprobeerd >= args.max_pogingen:
+        if heartbeat_nodig(ctx):
+            schrijf_log(ctx, "OK", "Gepauzeerd: {} pogingen voor dit token gedaan, "
+                        "geen daarvan hielp. Wacht op een nieuw token of een nieuwe "
+                        "login. Diagnose: {}".format(al_geprobeerd, ctx.diagnose))
+        stop_met("gepauzeerd", 1)
+
+    poging = al_geprobeerd + 1
+    schrijf_log(ctx, "INFO", "Token {} -- refreshpoging {}/{} via Claude Code CLI.".format(
+        duur(resterend_min), poging, args.max_pogingen))
+
+    if args.dry_run:
+        schrijf_log(ctx, "INFO", "dry-run: CLI niet gestart.")
+        stop_met("refresh-nodig", 0)
+
+    # --- 5. CLI starten met lege prompt -------------------------------
+    exe = vind_claude(ctx.claude)
+    if not exe:
+        schrijf_log(ctx, "FOUT", "claude niet gevonden. Geef het pad op met --claude.")
+        stop_met("mislukt", 1)
+
+    # Eigen, lege werkmap: geen project-CLAUDE.md, hooks of local settings
+    # die per ongeluk meedoen of aangepast worden.
+    os.makedirs(ctx.werkmap, exist_ok=True)
+    os.makedirs(ctx.diagnose, exist_ok=True)
+
+    pogingnaam = "{}-p{}".format(datetime.now().strftime("%Y%m%d-%H%M%S"), poging)
+    debug_pad = os.path.join(ctx.diagnose, "cli-{}.log".format(pogingnaam))
+
+    schrijf_momentopname(ctx, oauth, "voor", pogingnaam)
+
+    try:
+        r = subprocess.run(
+            [exe, "-p", "--no-session-persistence", "--debug-file", debug_pad],
+            cwd=ctx.werkmap, input=b"", capture_output=True, timeout=args.timeout)
+        exitcode = r.returncode
+    except subprocess.TimeoutExpired:
+        schrijf_log(ctx, "FOUT", "CLI reageerde niet binnen {} s en is "
+                    "afgebroken.".format(args.timeout))
+        schrijf_status(ctx, expires_at, poging)
+        stop_met("mislukt", 1)
+    except OSError as e:
+        schrijf_log(ctx, "FOUT", "Kan claude niet starten: {}".format(e))
+        stop_met("mislukt", 1)
+
+    # Exit 1 + "No messages returned from query" is hier de normale
+    # uitkomst: de lege prompt levert bewust geen model-antwoord op. Die
+    # uitkomst is identiek bij een kapotte login, dus er valt niets uit
+    # af te leiden — vandaar de expiry-controle hieronder.
+
+    # --- 6. Is de expiry echt opgeschoven? ----------------------------
+    time.sleep(0.3)
+    try:
+        na = lees_oauth(ctx.cred)
+    except (OSError, ValueError):
+        na = None
+    schrijf_momentopname(ctx, na, "na", pogingnaam)
+    ruim_debuglogs_op(ctx)
+
+    if na and na.get("expiresAt") and int(na["expiresAt"]) > expires_at:
+        schrijf_log(ctx, "OK", "Token ververst; nu geldig tot {}.".format(
+            klok(int(na["expiresAt"]))))
+        schrijf_status(ctx, int(na["expiresAt"]), 0)
+        stop_met("ververst", 0)
+
+    # Geen fout: de CLI vond het (nog) niet nodig omdat het token buiten
+    # haar eigen 5-minutenvenster valt. Kan alleen bij een verhoogde --marge.
+    if na and na.get("expiresAt"):
+        resterend_na = (int(na["expiresAt"]) - int(time.time() * 1000)) / 60000.0
+        if resterend_na > 5:
+            schrijf_log(ctx, "OK", "CLI vond verversen nog niet nodig; token {}.".format(
+                duur(resterend_na)))
+            stop_met("geldig", 0)
+
+    # --- 7. Uitzoeken WAAROM het niet lukte ---------------------------
+    schrijf_status(ctx, expires_at, poging)
+
+    for regel in debug_hoogtepunten(debug_pad):
+        schrijf_log(ctx, "DEBUG", regel)
+
+    if na and (not na.get("refreshToken") or not na.get("accessToken")):
+        schrijf_log(ctx, "FOUT", "De CLI heeft de login leeggemaakt (refresh-token "
+                    "geweigerd). Nodig: claude auth login. Debuglog: {}".format(debug_pad))
+        stop_met("login-nodig", 1)
+
+    ingelogd = is_ingelogd(exe, ctx.werkmap)
+    if ingelogd is False:
+        schrijf_log(ctx, "FOUT", "Auth-controle: niet meer ingelogd. Nodig: "
+                    "claude auth login. Debuglog: {}".format(debug_pad))
+        stop_met("login-nodig", 1)
+
+    auth_tekst = "auth-status onbekend" if ingelogd is None else "login staat nog"
+    schrijf_log(ctx, "FOUT", "Poging {}/{} mislukt: expiry niet opgeschoven "
+                "({}, CLI exit {}). Debuglog: {}".format(
+                    poging, args.max_pogingen, auth_tekst, exitcode, debug_pad))
+    stop_met("mislukt", 1)
+
+
+if __name__ == "__main__":
+    main()
