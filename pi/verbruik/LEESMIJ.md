@@ -98,11 +98,37 @@ uname -m && python3 --version && (command -v claude && claude --version || echo 
 
 ### Stap 1 — Claude Code + login
 
-Installeer de CLI en log eenmalig in:
+ARM64 wordt officieel ondersteund (eis: 4 GB+ RAM, Debian 10+). Gebruik op een
+always-on Pi de **apt-repository** en niet de curl-installer: die laatste
+werkt met een achtergrond-auto-updater, terwijl apt meegaat met je normale
+`apt upgrade` — voor een machine waar een unattended timer op draait wil je
+niet dat de CLI-versie 's nachts verschuift. Het `stable`-kanaal loopt bewust
+ongeveer een week achter en slaat releases met grote regressies over.
 
 ```bash
-claude auth login
+sudo install -d -m 0755 /etc/apt/keyrings
+sudo curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /etc/apt/keyrings/claude-code.asc
+gpg --show-keys /etc/apt/keyrings/claude-code.asc
 ```
+
+Controleer dat de fingerprint exact `31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF
+1A7E CACE` is vóór je verder gaat. Daarna:
+
+```bash
+echo "deb [signed-by=/etc/apt/keyrings/claude-code.asc] https://downloads.claude.ai/claude-code/apt/stable stable main" | sudo tee /etc/apt/sources.list.d/claude-code.list
+sudo apt update && sudo apt install claude-code
+claude --version && claude doctor
+```
+
+Log daarna eenmalig in (de enige interactieve stap):
+
+```bash
+claude
+```
+
+Bijwerken gaat later met `sudo apt update && sudo apt upgrade claude-code`.
+Claude Code meldt soms een update vóór die in de repository staat — dat is een
+bekend gedrag van het package-manager-pad, geen fout.
 
 Controleer daarna dat het credentialsbestand er is:
 
