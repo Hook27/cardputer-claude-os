@@ -27,13 +27,13 @@ PI_ENDPOINTS = (
 
 # Scanner app — base URL of scanservjs (the SANE web frontend) on the Pi
 # that has the scanner attached. LAN IP, no trailing slash, e.g.
-#   "http://192.168.178.45:8090"
+#   "http://<pi-lan-ip>:8090"
 # The Cardputer reaches it over the local network (not Tailscale), so use
 # the Pi's LAN IP — ideally a DHCP reservation so it never changes.
 SCANNER_BASE = ""
 
 # Claude verbruik app — endpoint serving your Claude limit percentages,
-# e.g. "http://192.168.178.234:8091/verbruik". Run
+# e.g. "http://<pi-lan-ip>:8091/verbruik". Run
 # ``pi/verbruik/claude_verbruik_server.py`` on the machine that holds the
 # Claude Code login; the device never sees a token, only percentages.
 # For an offline dry-run, point this at ``fake_verbruik_server.py``.

@@ -138,14 +138,21 @@ def _maak_handler(staat, vertraag_s):
 def _lan_ip():
     """Beste gok voor het LAN-adres van deze machine.
 
-    We openen een UDP-socket naar een adres in het eigen subnet; er gaat
-    geen pakket uit, maar de kernel kiest wel de uitgaande interface en
-    dat adres is precies wat de Cardputer moet benaderen. Betrouwbaarder
-    dan gethostbyname(hostname), dat op Windows vaak 127.0.0.1 geeft.
+    We openen een UDP-socket naar een adres buiten deze machine; er gaat
+    geen pakket uit, maar de kernel kiest wel alvast de uitgaande interface
+    en dát adres is wat de Cardputer moet benaderen. Betrouwbaarder dan
+    gethostbyname(hostname), dat op Windows vaak 127.0.0.1 geeft.
+
+    Het doeladres komt uit de documentatierange van RFC 5737 — het bestaat
+    bewust nergens, dus er valt niets uit af te leiden over het netwerk waar
+    dit op draait. Let op: de kernel kiest hiermee de interface van de
+    *default route*. Heeft deze machine een VPN die het verkeer overneemt,
+    dan kan het getoonde adres dat van de VPN zijn in plaats van je LAN —
+    controleer het dan even voor je het in config.py zet.
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("192.168.178.1", 9))
+        s.connect(("192.0.2.1", 9))
         return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"

@@ -16,10 +16,9 @@ repo), which serves on :8081/temp:
 Two cards side by side, same three-zone chrome as the rest of the
 bundle (hello_cardputer / snake / claude_buddy): a 20 px DARK header
 with an ORANGE hairline at y=20, the two cards below, and a hint strip
-at the bottom. **NC-Pi5** (192.168.178.45) is the LEFT card,
-**TaSc-Pi5** (192.168.178.234) the RIGHT. The addresses actually used
-come from ``PI_ENDPOINTS`` in ``apps/config.py``; these are just the
-current values, noted so the cards are identifiable at a glance.
+at the bottom. **NC-Pi5** is the LEFT card, **TaSc-Pi5** the RIGHT.
+Their addresses come from ``PI_ENDPOINTS`` in ``apps/config.py``, which
+is gitignored so the LAN layout stays out of the repo.
 
 ### Pages
 

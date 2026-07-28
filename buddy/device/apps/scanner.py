@@ -83,7 +83,7 @@ _TOP = 24
 _BOTTOM = _H - 18
 
 # Basis-URL van scanservjs op NC-Pi5, uit config.py (gitignored). Bijv.
-# "http://192.168.178.45:8090". Trailing slash wordt afgekapt.
+# "http://<pi-lan-ip>:8090". Trailing slash wordt afgekapt.
 try:
     from apps.config import SCANNER_BASE as _BASE
 except Exception:

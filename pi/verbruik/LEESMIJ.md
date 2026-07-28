@@ -198,10 +198,11 @@ curl -s http://localhost:8091/verbruik
 
 ### Stap 5 — de Cardputer erop richten
 
-Zet in `buddy/device/apps/config.py`:
+Zet in `buddy/device/apps/config.py` (gitignored, dus daar mag het echte
+adres wél in staan):
 
 ```python
-VERBRUIK_ENDPOINT = "http://192.168.178.234:8091/verbruik"
+VERBRUIK_ENDPOINT = "http://<pi-lan-ip>:8091/verbruik"
 ```
 
 en push `config.py` naar het toestel.

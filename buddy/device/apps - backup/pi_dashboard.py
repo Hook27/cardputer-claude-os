@@ -16,8 +16,7 @@ repo), which serves on :8081/temp:
 Two cards side by side, same three-zone chrome as the rest of the
 bundle (hello_cardputer / snake / claude_buddy): a 20 px DARK header
 with an ORANGE hairline at y=20, the two cards below, and a hint strip
-at the bottom. **NC-Pi5** (192.168.178.45) is the LEFT card,
-**TaSc-Pi5** (192.168.178.122) the RIGHT.
+at the bottom. **NC-Pi5** is the LEFT card, **TaSc-Pi5** the RIGHT.
 
 ### Pages
 
@@ -80,9 +79,12 @@ _W = 240
 _H = 135
 
 # The two Pis, in card order: index 0 = left, index 1 = right.
+# Oude snapshot: deze versie had de adressen nog hardcoded. De live app in
+# ``apps/`` leest ze uit ``apps/config.py`` (gitignored). Vul hier je eigen
+# LAN-IP's in als je deze snapshot ooit zou willen draaien.
 _PIS = (
-    {"name": "NC-Pi5", "url": "http://192.168.178.45:8081/temp"},
-    {"name": "TaSc-Pi5", "url": "http://192.168.178.122:8081/temp"},
+    {"name": "NC-Pi5", "url": "http://<pi-lan-ip>:8081/temp"},
+    {"name": "TaSc-Pi5", "url": "http://<pi-lan-ip>:8081/temp"},
 )
 
 # Page identifiers and their header labels.
