@@ -93,6 +93,10 @@ BEWAAR_DEBUG = 5
 # Lokale verbruikserver, om te controleren of het token niet alleen vers maar
 # ook werkzaam is. Leeg maken (of --server "") schakelt die controle uit.
 SERVER_URL = "http://127.0.0.1:8091/verbruik"
+# Een verbindingsfout mag een tweede kans krijgen: vlak na een herstart is de
+# poort nog niet open, en een loos alarm ondermijnt de bewaking.
+SERVER_POGINGEN = 2
+SERVER_PAUZE_S = 3.0
 
 _HOME = os.path.expanduser("~")
 _CRED_PAD = os.path.join(_HOME, ".claude", ".credentials.json")
@@ -168,34 +172,52 @@ def heartbeat_nodig(ctx, niveau="OK"):
 # --- gezondheid van de verbruikserver --------------------------------
 
 
-def server_toestand(url, timeout=4):
+def server_toestand(url, timeout=4, pogingen=SERVER_POGINGEN,
+                    pauze_s=SERVER_PAUZE_S):
     """Vraag de verbruikserver hoe het met hem gaat.
 
     Bewust GEEN eigen API-call: we lezen de toestand van de server, die de
     call toch al doet. Een tweede poller zou het rate-limit-venster kunnen
     raken — precies waardoor het op 2026-08-03 misging.
 
+    Een verbindingsfout krijgt een tweede kans na ``pauze_s`` seconden. Een
+    herstart van de service is genoeg om de eerste poging te laten stuiten
+    (systemd meldt de unit actief zodra het proces draait, niet zodra het de
+    poort heeft geopend), en bewaking die af en toe onterecht alarm slaat leer
+    je negeren — dan doet ze niet meer waarvoor ze bedoeld is.
+
+    Een server die wél antwoordt maar geen live cijfers heeft, melden we
+    meteen: daar is niets tijdelijks aan.
+
     Geeft ``(gezond, tekst)``. ``gezond`` is None wanneer er niets te zeggen
     valt (controle uitgeschakeld), True bij verse cijfers, en False als de
-    server draait maar geen live data heeft of helemaal niet reageert.
+    server geen live data heeft of na alle pogingen niet reageert.
     """
     if not url:
         return None, ""
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return False, "verbruikserver reageert niet ({})".format(e)
 
-    bron = (data or {}).get("bron") or "?"
-    if bron == "live":
-        return True, "verbruikserver: live"
-    if bron == "geweigerd":
-        # Dit is het scenario dat we tot 2026-08-03 niet zagen: het token
-        # wordt keurig ververst, maar de API accepteert het niet meer.
-        return False, ("verbruikserver krijgt 'geweigerd' -- het token wordt "
-                       "wel ververst maar niet geaccepteerd. Nodig: claude auth login")
-    return False, "verbruikserver: geen live cijfers (bron '{}')".format(bron)
+    laatste_fout = "verbruikserver reageert niet"
+    for poging in range(1, max(1, pogingen) + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            laatste_fout = "verbruikserver reageert niet ({})".format(e)
+            if poging < pogingen:
+                time.sleep(pauze_s)
+            continue
+
+        bron = (data or {}).get("bron") or "?"
+        if bron == "live":
+            return True, "verbruikserver: live"
+        if bron == "geweigerd":
+            # Dit is het scenario dat we tot 2026-08-03 niet zagen: het token
+            # wordt keurig ververst, maar de API accepteert het niet meer.
+            return False, ("verbruikserver krijgt 'geweigerd' -- het token wordt "
+                           "wel ververst maar niet geaccepteerd. Nodig: claude auth login")
+        return False, "verbruikserver: geen live cijfers (bron '{}')".format(bron)
+
+    return False, laatste_fout
 
 
 def stop_met(code, exitcode=0):
@@ -361,6 +383,10 @@ def main():
     p.add_argument("--server", default=SERVER_URL,
                    help="verbruikserver om de gezondheid bij op te vragen; "
                         "leeg laten schakelt die controle uit")
+    p.add_argument("--server-pogingen", type=int, default=SERVER_POGINGEN,
+                   help="aantal pogingen voor de gezondheidscontrole")
+    p.add_argument("--server-pauze", type=float, default=SERVER_PAUZE_S,
+                   help="seconden tussen die pogingen")
     args = p.parse_args()
 
     ctx = Ctx(args.credentials, args.staat_map, args.claude)
@@ -399,7 +425,8 @@ def main():
         # Een geldig token is niet hetzelfde als een wérkend token. Vraag de
         # verbruikserver of hij er nog cijfers mee ophaalt; anders blijft dit
         # script "niets te doen" melden terwijl het scherm al uren hangt.
-        gezond, gezondheidstekst = server_toestand(args.server)
+        gezond, gezondheidstekst = server_toestand(
+            args.server, pogingen=args.server_pogingen, pauze_s=args.server_pauze)
         if gezond is False:
             if heartbeat_nodig(ctx, "WAARSCHUWING"):
                 schrijf_log(ctx, "WAARSCHUWING", "Token {} (tot {}), maar {}.".format(

@@ -154,6 +154,36 @@ def _start_nepserver(payload):
     return srv, "http://127.0.0.1:{}/verbruik".format(srv.server_port)
 
 
+def _start_hakkelende_server(payload, keer_falen=1):
+    """Nepserver die de eerste ``keer_falen`` aanvragen weigert.
+
+    Bootst na wat er bij een herstart gebeurt: de eerste poging stuit, de
+    volgende lukt. Geeft ook de teller terug zodat de test kan vaststellen dat
+    er daadwerkelijk opnieuw geprobeerd is.
+    """
+    teller = {"n": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_GET(self):
+            teller["n"] += 1
+            if teller["n"] <= keer_falen:
+                self.send_error(503, "nog niet zover")
+                return
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:{}/verbruik".format(srv.server_port), teller
+
+
 def _leeslog(staat):
     try:
         with open(os.path.join(staat, "ververs-claude-token.log"),
@@ -296,12 +326,42 @@ def main():
         u.check("geweigerd -> WAARSCHUWING", "[WAARSCHUWING]" in log, True)
         u.check("geweigerd -> noemt de oplossing", "claude auth login" in log, True)
 
-        # 14. Server onbereikbaar -> ook een waarschuwing.
+        # 14. Server onbereikbaar -> ook een waarschuwing, maar pas na alle
+        #     pogingen. (Korte pauze zodat de test niet gaat zitten wachten.)
         cred, staat = verse_omgeving("serverweg")
         _schrijf_creds(cred, resterend_min=300)
         _draai(cred, staat, claude,
-               extra=["--server", "http://127.0.0.1:9/verbruik"])
+               extra=["--server", "http://127.0.0.1:9/verbruik",
+                      "--server-pauze", "0.1"])
         u.check("server onbereikbaar -> WAARSCHUWING",
+                "[WAARSCHUWING]" in _leeslog(staat), True)
+
+        # 14b. Eén mislukte poging is géén alarm: vlak na een herstart is de
+        #      poort nog niet open, en loos alarm ondermijnt de bewaking.
+        cred, staat = verse_omgeving("hakkelt")
+        _schrijf_creds(cred, resterend_min=300)
+        srv, url, teller = _start_hakkelende_server({"bron": "live"}, keer_falen=1)
+        try:
+            _draai(cred, staat, claude,
+                   extra=["--server", url, "--server-pauze", "0.1"])
+        finally:
+            srv.shutdown()
+        log = _leeslog(staat)
+        u.check("1e poging faalt, 2e lukt -> geen alarm",
+                "[WAARSCHUWING]" in log, False)
+        u.check("1e poging faalt, 2e lukt -> meldt live", "live" in log, True)
+        u.check("er is echt opnieuw geprobeerd", teller["n"], 2)
+
+        # 14c. Blijft hij weigeren, dan komt de waarschuwing alsnog.
+        cred, staat = verse_omgeving("blijfthakkelen")
+        _schrijf_creds(cred, resterend_min=300)
+        srv, url, teller = _start_hakkelende_server({"bron": "live"}, keer_falen=5)
+        try:
+            _draai(cred, staat, claude,
+                   extra=["--server", url, "--server-pauze", "0.1"])
+        finally:
+            srv.shutdown()
+        u.check("beide pogingen falen -> WAARSCHUWING",
                 "[WAARSCHUWING]" in _leeslog(staat), True)
 
         # 15. Controle uitgeschakeld -> gedraagt zich als voorheen.
