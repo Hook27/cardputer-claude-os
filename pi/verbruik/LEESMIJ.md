@@ -21,7 +21,7 @@ Daarom: een losse app die WiFi gebruikt en geen BLE, precies zoals
 Pi (heeft de Claude Code-login)          Cardputer (LAN)
 ────────────────────────────────         ─────────────────
 token -> GET /api/oauth/usage
-  cache ~90 s
+  cache 5 min (+ backoff bij 429)
   ▼
 :8091/verbruik  ◀──────────────────────  elke 45 s: requests.get(...)
   {"five_hour":42, ...}                    -> balken + aftelklok
@@ -85,8 +85,29 @@ Bestanden:
 |---|---|
 | `claude_verbruik_server.py` | haalt op + serveert `:8091/verbruik` |
 | `ververs-claude-token.py` | houdt het token geldig (Linux-port van de `.ps1`) |
-| `test-ververs-claude-token.py` | offline test met nep-credentials |
+| `test-ververs-claude-token.py` | offline test van de refresh, met nep-credentials |
+| `test-verbruik-server.py` | offline test van cache + rate-limit-backoff |
 | `systemd/*.service`, `*.timer` | user-units voor beide |
+
+### Rate limiting
+
+Het usage-endpoint heeft een eigen request-limiet. Op 2026-08-03 liep de
+server daar tegenaan (HTTP 429) en bleef hij in hetzelfde tempo doorvragen,
+waardoor toestel en widget een halve dag `gemeten` toonden in plaats van
+`live`. Sindsdien:
+
+- de cache staat op **5 minuten** (~288 in plaats van ~960 verzoeken per dag);
+  voor een venster van 5 uur is dat ruim vers genoeg, en de Cardputer merkt er
+  niets van omdat die de cache leest;
+- bij een **429 wacht de server** — zo lang als `Retry-After` aangeeft, en
+  anders oplopend van 5 minuten tot maximaal een uur, met herstel na de eerste
+  geslaagde poging;
+- andere fouten (netwerk, 5xx) pauzeren níet: die komen niet door ons tempo.
+
+Zie je in de journal `rate limit (429); volgende poging over N min`, dan werkt
+dit zoals bedoeld. Blijft dat uren aanhouden, dan vraagt iets anders ook met
+dit token — controleer of er niet nog een tweede verbruikserver of widget op de
+API zelf pollt.
 
 ### Stap 0 — kan Claude Code hier draaien?
 

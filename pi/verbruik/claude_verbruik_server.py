@@ -26,12 +26,21 @@ De API geeft `resets_at` als ISO-tijdstip. Wij rekenen dat hier om naar
 zijn eigen klok (die van NTP komt en er soms naast zit) er niet toe doet.
 Het toestel telt lokaal verder af tussen twee polls.
 
-### Cache
+### Cache en rate limit
 
 De API heeft een eigen request-limiet, dus we halen hoogstens elke
 CACHE_S seconden verse cijfers op; alle pollende clients binnen dat
 venster krijgen dezelfde waarden. Het toestel pollt elke 45 s, wat dus
 ruim binnen de cache valt — precies de bedoeling.
+
+Op 2026-08-03 liep dit toch tegen een HTTP 429 aan, en de server bleef
+daarna in hetzelfde tempo doorvragen. Dat helpt niet en kan de blokkade in
+stand houden, want een limiet telt geweigerde verzoeken vaak gewoon mee.
+Daarom nu twee dingen: de cache staat standaard op 5 minuten (~288 in
+plaats van ~960 verzoeken per dag, en voor een venster van 5 uur is dat
+ruim vers genoeg), en bij een 429 wachten we — zo lang als de server zelf
+in `Retry-After` aangeeft, en anders oplopend van 5 minuten tot maximaal
+een uur. Na een geslaagde poging valt alles terug op het normale ritme.
 
 ### Terugval
 
@@ -58,6 +67,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -69,8 +79,13 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 UA = "claude-code/2.1.217"
 BETA = "oauth-2025-04-20"
 
-CACHE_S = 90          # niet vaker dan dit bij Anthropic langs
+CACHE_S = 300         # niet vaker dan dit bij Anthropic langs
 HTTP_TIMEOUT_S = 10
+
+# Wachttijden na een HTTP 429, als de server zelf geen Retry-After meegeeft.
+# Verdubbelt per mislukte poging tot het maximum; na succes weer op nul.
+BACKOFF_START_S = 300
+BACKOFF_MAX_S = 3600
 
 _CRED_PAD = os.path.expanduser("~/.claude/.credentials.json")
 
@@ -149,8 +164,37 @@ def _resterend(waarde):
     return max(int(epoch - time.time()), 0)
 
 
+def _retry_after(e):
+    """Seconden uit een Retry-After-header, of None als die er niet bruikbaar is.
+
+    De header mag twee vormen hebben: een aantal seconden, of een HTTP-datum.
+    We accepteren beide en negeren onzin — dan valt de aanroeper terug op zijn
+    eigen oplopende wachttijd, wat altijd een veilige ondergrens is.
+    """
+    ruw = e.headers.get("Retry-After") if e.headers else None
+    if not ruw:
+        return None
+    ruw = str(ruw).strip()
+    try:
+        return max(int(float(ruw)), 1)
+    except ValueError:
+        pass
+    try:
+        dt = parsedate_to_datetime(ruw)
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(int(dt.timestamp() - time.time()), 1)
+    except (TypeError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _haal_verbruik(token):
-    """Roep het usage-endpoint aan. ``(stand, None)`` of ``(None, fout)``.
+    """Roep het usage-endpoint aan. ``(stand, None, None)`` of ``(None, fout, wacht)``.
+
+    ``wacht`` is alleen gevuld bij een 429 waarbij de server een Retry-After
+    meegaf; anders None.
 
     `utilization` is al een percentage (0-100) — zo gebruikt de widget op
     de laptop het ook, dus we schalen niets.
@@ -167,10 +211,12 @@ def _haal_verbruik(token):
         if e.code in (401, 403):
             # Verlopen of ingetrokken token. Niet zelf verversen — dat is
             # het werk van ververs-claude-token.py.
-            return None, "geen-token"
-        return None, "http {}".format(e.code)
+            return None, "geen-token", None
+        if e.code == 429:
+            return None, "http 429", _retry_after(e)
+        return None, "http {}".format(e.code), None
     except (urllib.error.URLError, OSError) as e:
-        return None, "netwerk: {}".format(e)
+        return None, "netwerk: {}".format(e), None
 
     try:
         data = json.loads(ruw)
@@ -181,9 +227,9 @@ def _haal_verbruik(token):
             "seven_day": float(wk.get("utilization")),
             "fh_reset_in_s": _resterend(vh.get("resets_at")),
             "sd_reset_in_s": _resterend(wk.get("resets_at")),
-        }, None
+        }, None, None
     except (ValueError, TypeError, AttributeError) as e:
-        return None, "antwoord onbegrijpelijk: {}".format(e)
+        return None, "antwoord onbegrijpelijk: {}".format(e), None
 
 
 # ---- cache ----------------------------------------------------------
@@ -205,30 +251,84 @@ class Verbruik:
         self._stand_ts = 0.0     # wanneer die gemeten is
         self._laatste_poging = 0.0
         self._bron = "geen-data"
+        # Backoff na een 429: vóór _pauze_tot doen we geen poging, en
+        # _backoff_s is de wachttijd die we bij een volgende weigering
+        # verdubbelen. Beide terug op nul zodra er weer iets lukt.
+        self._pauze_tot = 0.0
+        self._backoff_s = 0
+        # Sleutel van de laatst gelogde toestand, zodat een aanhoudende fout
+        # één regel oplevert in plaats van één per cyclus.
+        self._laatste_melding = None
 
     def stand(self):
         with self._slot:
             nu = time.time()
-            if nu - self._laatste_poging >= self.cache_s:
+            # Twee remmen: het normale cache-interval, en een eventuele
+            # backoff-pauze na een rate limit. Die tweede overrulet de eerste.
+            if nu - self._laatste_poging >= self.cache_s and nu >= self._pauze_tot:
                 self._laatste_poging = nu
                 self._verzamel()
             return self._payload()
 
+    def _meld(self, tekst, sleutel):
+        """Log alleen wanneer de toestand verandert.
+
+        De vorige versie vergeleek de foutmelding met ``self._bron``, en die
+        twee zijn nooit gelijk ("http 429" tegen "fout") — daardoor liep de
+        journal vol met een identieke regel per cyclus. De sleutel staat nu
+        los van de bron, zodat ook een oplopende backoff netjes één regel per
+        stap geeft.
+        """
+        if self._laatste_melding != sleutel:
+            _log(tekst)
+        self._laatste_melding = sleutel
+
+    def _plan_backoff(self, wacht):
+        """Bepaal hoe lang we na een 429 niets proberen."""
+        if wacht is not None:
+            pauze = wacht          # de server weet het beter dan wij
+        elif self._backoff_s <= 0:
+            pauze = BACKOFF_START_S
+        else:
+            pauze = self._backoff_s * 2
+        self._backoff_s = min(int(pauze), BACKOFF_MAX_S)
+        self._pauze_tot = time.time() + self._backoff_s
+
+    def _reset_backoff(self):
+        self._backoff_s = 0
+        self._pauze_tot = 0.0
+
     def _verzamel(self):
         token, _expires, fout = _lees_token(self.cred_pad)
         if token is None:
-            if self._bron != "geen-token":
-                _log("token niet bruikbaar:", fout)
+            self._meld("token niet bruikbaar: {}".format(fout), "geen-token")
             self._bron = "geen-token"
             return
-        stand, fout = _haal_verbruik(token)
+
+        stand, fout, wacht = _haal_verbruik(token)
         if stand is None:
-            if self._bron != fout:
-                _log("ophalen mislukt:", fout)
-            self._bron = fout if fout == "geen-token" else "fout"
+            if fout == "http 429":
+                # De API zegt expliciet dat we te vaak vragen. In hetzelfde
+                # tempo doorgaan lost niets op en houdt de blokkade mogelijk in
+                # stand, dus we wachten eerst — en loggen hoe lang, zodat in de
+                # journal te zien is wanneer hij het opnieuw probeert.
+                self._plan_backoff(wacht)
+                bron_van_de_wachttijd = "server" if wacht is not None else "oplopend"
+                self._meld(
+                    "ophalen mislukt: rate limit (429); volgende poging over "
+                    "{} min ({})".format(max(1, self._backoff_s // 60),
+                                         bron_van_de_wachttijd),
+                    "429:{}".format(self._backoff_s))
+            else:
+                # Andere fouten komen niet door ons tempo, dus daar blijven we
+                # gewoon op het cache-ritme opnieuw proberen.
+                self._reset_backoff()
+                self._meld("ophalen mislukt: {}".format(fout), fout)
+            self._bron = "geen-token" if fout == "geen-token" else "fout"
             return
-        if self._bron != "live":
-            _log("live cijfers opgehaald")
+
+        self._reset_backoff()
+        self._meld("live cijfers opgehaald", "live")
         self._stand = stand
         self._stand_ts = time.time()
         self._bron = "live"
