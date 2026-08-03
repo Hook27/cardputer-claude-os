@@ -172,21 +172,30 @@ python3 -c "import json,os;d=json.load(open(os.path.expanduser('~/.claude/.crede
 
 ```bash
 mkdir -p ~/claude-verbruik && cd ~/claude-verbruik
-# kopieer hierheen: claude_verbruik_server.py, ververs-claude-token.py,
-# test-ververs-claude-token.py
+BASE=https://raw.githubusercontent.com/Hook27/cardputer-claude-os/main/pi/verbruik
+for f in claude_verbruik_server.py ververs-claude-token.py \
+         test-ververs-claude-token.py test-verbruik-server.py; do
+  curl -fsSL "$BASE/$f" -o "$f"
+done
 ```
+
+Ditzelfde blok haalt later ook updates op; alleen het opnieuw starten van de
+service is dan nog nodig.
 
 ### Stap 3 — eerst testen, dan pas aanzetten
 
-De offline test raakt je echte token niet aan (nep-credentials, nep-CLI,
-geen netwerk) en lokt juist de gevaarlijke paden uit: pogingenlimiet,
-leeggemaakte login, verlopen refresh-token.
+Beide tests raken je echte token niet aan (nep-credentials, nep-CLI,
+nep-server, geen netwerk) en lokken juist de gevaarlijke paden uit:
+pogingenlimiet, leeggemaakte login, verlopen refresh-token, rate-limit-backoff
+en een server die niet reageert.
 
 ```bash
 python3 ~/claude-verbruik/test-ververs-claude-token.py
+python3 ~/claude-verbruik/test-verbruik-server.py
 ```
 
-Verwacht: `13 goed, 0 fout`. Daarna één echte, ongevaarlijke controle —
+Verwacht: `24 goed, 0 fout` en `15 goed, 0 fout`. Daarna één echte,
+ongevaarlijke controle —
 `--dry-run` bepaalt wel de actie maar start de CLI niet:
 
 ```bash
@@ -254,6 +263,28 @@ en push `config.py` naar het toestel.
   Dat gat kostte op 2026-08-03 een halve dag: het token werd keurig ververst
   terwijl de API het weigerde, en de log bleef `[OK]` melden. De controle
   doet géén eigen API-call — hij leest de server, die de call toch al doet.
+  Een tweede poller zou namelijk het rate-limit-venster kunnen raken, en dat
+  was nu juist de oorzaak van die storing.
+- **Een verbindingsfout krijgt een tweede kans**, standaard na 3 seconden.
+  `systemctl --user restart` meldt de unit actief zodra het proces draait,
+  niet zodra het de poort heeft geopend — een controle die er meteen
+  achteraan komt krijgt dus `Connection refused` terwijl er niets aan de hand
+  is. Bewaking die af en toe onterecht alarm slaat leer je negeren, en dan
+  doet ze niet meer waarvoor ze bedoeld is. Een server die wél antwoordt maar
+  geen live cijfers heeft, meldt onveranderd meteen; daar is niets tijdelijks
+  aan. Instelbaar met `--server-pogingen` en `--server-pauze`.
+- De controle richt zich standaard op `http://127.0.0.1:8091/verbruik`. Een
+  ander adres geef je met `--server`; een lege waarde (`--server ""`) schakelt
+  hem uit, wat de tests ook gebruiken om hermetisch te blijven.
+
+  Wil je de regel meteen zien in plaats van te wachten op de uurrem — die
+  onderdrukt herhaling, dus vaak schrijft de timer hem al — draai dan:
+
+  ```bash
+  python3 ~/claude-verbruik/ververs-claude-token.py --server-pauze 0.1 2>&1 | tail -2
+  ```
+
+  De logregels gaan ook naar stderr, dus die zie je zo altijd.
 - Diagnose per poging (CLI-debuglogs, momentopnames met vingerafdrukken —
   geen tokens) staat in `~/.local/state/claude-token-refresh/diagnose/`.
 - `exit 1` van de refresh-unit is normaal: het script gebruikt die code ook
