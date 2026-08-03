@@ -51,6 +51,19 @@ met een afwijkende `bron`, zodat het toestel kan tonen dat het om oude
 gegevens gaat. Vlak na een herstart zonder geldig token is er niets te
 tonen en blijven de velden leeg (het toestel toont dan "--").
 
+`bron` zegt hoe vers de cijfers zijn, en waarom niet:
+
+    live        vers van de API
+    gemeten     ophalen mislukt, dit zijn de laatst bekende cijfers
+    geweigerd   er is een token, maar de API accepteert het niet (401/403)
+                -> `claude auth login` op deze machine
+    geen-token  geen bruikbaar credentialsbestand gevonden
+
+"geweigerd" en "geen-token" staan er bewust apart in. Een token met een
+expiry ver in de toekomst kan tóch geweigerd worden, en dan helpt afwachten
+niet — dat onderscheid ontbrak tot 2026-08-03 en maakte de diagnose
+onnodig lastig.
+
 Gebruik:
 
     python3 claude_verbruik_server.py                 # 0.0.0.0:8091
@@ -164,6 +177,23 @@ def _resterend(waarde):
     return max(int(epoch - time.time()), 0)
 
 
+def _api_melding(e):
+    """Korte foutbeschrijving uit het JSON-antwoord van de API.
+
+    Bij een geweigerd token staat daar bijvoorbeeld
+    `authentication_error: Invalid authentication credentials` — precies wat je
+    in de journal wilt zien, want "geweigerd" alleen zegt niet waarom.
+    """
+    try:
+        data = json.loads(e.read().decode("utf-8", "replace"))
+        f = (data or {}).get("error") or {}
+        soort = f.get("type") or "?"
+        tekst = f.get("message") or ""
+        return "{}: {}".format(soort, tekst).strip(": ")
+    except (ValueError, OSError, AttributeError):
+        return "geen leesbare foutmelding"
+
+
 def _retry_after(e):
     """Seconden uit een Retry-After-header, of None als die er niet bruikbaar is.
 
@@ -208,12 +238,16 @@ def _haal_verbruik(token):
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
             ruw = resp.read().decode("utf-8")
     except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            # Verlopen of ingetrokken token. Niet zelf verversen — dat is
-            # het werk van ververs-claude-token.py.
-            return None, "geen-token", None
         if e.code == 429:
             return None, "http 429", _retry_after(e)
+        if e.code in (401, 403):
+            # Credentials geweigerd. Dit is NIET hetzelfde als "geen token":
+            # het bestand kan een token bevatten met een expiry ver in de
+            # toekomst en tóch geweigerd worden (zo ging het op 2026-08-03).
+            # Die twee eerder op één hoop gooien maakte de diagnose lastiger,
+            # want het scherm zei "geen-token" terwijl er wél een token was.
+            # Niet zelf verversen — dat is het werk van ververs-claude-token.py.
+            return None, "http {}: {}".format(e.code, _api_melding(e)), None
         return None, "http {}".format(e.code), None
     except (urllib.error.URLError, OSError) as e:
         return None, "netwerk: {}".format(e), None
@@ -233,6 +267,11 @@ def _haal_verbruik(token):
 
 
 # ---- cache ----------------------------------------------------------
+
+
+def _is_geweigerd(fout):
+    """True bij een 401/403 — token aanwezig maar niet geaccepteerd."""
+    return bool(fout) and (fout.startswith("http 401") or fout.startswith("http 403"))
 
 
 class Verbruik:
@@ -324,7 +363,10 @@ class Verbruik:
                 # gewoon op het cache-ritme opnieuw proberen.
                 self._reset_backoff()
                 self._meld("ophalen mislukt: {}".format(fout), fout)
-            self._bron = "geen-token" if fout == "geen-token" else "fout"
+            # "geweigerd" is bewust een eigen bron: er ís een token, het wordt
+            # alleen niet geaccepteerd. Dat vraagt om `claude auth login`, niet
+            # om afwachten — en dat verschil hoort op het scherm te staan.
+            self._bron = "geweigerd" if _is_geweigerd(fout) else "fout"
             return
 
         self._reset_backoff()

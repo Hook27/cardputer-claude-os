@@ -25,7 +25,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 _HIER = os.path.dirname(os.path.abspath(__file__))
 _SCRIPT = os.path.join(_HIER, "ververs-claude-token.py")
@@ -113,8 +115,11 @@ def _schrijf_creds(pad, resterend_min, refresh_token="rt-abc",
 def _draai(cred, staat, claude, mode="niets", extra=None):
     """Start het echte script en geef de RESULTAAT-code terug."""
     omgeving = dict(os.environ, FAKE_MODE=mode, FAKE_CRED=cred)
+    # --server "" houdt deze tests hermetisch: zonder dat zou het script de
+    # echte verbruikserver op poort 8091 van de testmachine proberen.
     cmd = [sys.executable, _SCRIPT, "--credentials", cred,
-           "--staat-map", staat, "--claude", claude, "--timeout", "60"]
+           "--staat-map", staat, "--claude", claude, "--timeout", "60",
+           "--server", ""]
     if extra:
         cmd += extra
     r = subprocess.run(cmd, capture_output=True, env=omgeving, timeout=180)
@@ -123,6 +128,39 @@ def _draai(cred, staat, claude, mode="niets", extra=None):
         if regel.startswith("RESULTAAT:"):
             return regel.split(":", 1)[1].strip(), r.returncode
     return "(geen resultaat: {})".format(uit.strip()[:120]), r.returncode
+
+
+def _start_nepserver(payload):
+    """Piepklein HTTP-servertje dat één vaste JSON teruggeeft.
+
+    Staat de gezondheidscontrole toe zonder de echte verbruikserver, en zonder
+    het netwerk op te gaan. Poort 0 laat het OS er een vrije kiezen, zodat
+    parallelle runs elkaar niet in de weg zitten.
+    """
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_GET(self):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, "http://127.0.0.1:{}/verbruik".format(srv.server_port)
+
+
+def _leeslog(staat):
+    try:
+        with open(os.path.join(staat, "ververs-claude-token.log"),
+                  encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 class Uitslag:
@@ -229,6 +267,50 @@ def main():
         with open(cred, encoding="utf-8") as f:
             na = json.load(f)["claudeAiOauth"]["accessToken"]
         u.check("script schrijft niet zelf in creds", na, "at-onaangeroerd")
+
+        # --- gezondheidscontrole (het gat van 2026-08-03) ----------------
+        # Een geldig token terwijl de server er geen cijfers mee ophaalt moet
+        # een WAARSCHUWING opleveren, niet het geruststellende "niets te doen".
+
+        # 12. Server meldt live -> gewone OK-regel, geen waarschuwing.
+        cred, staat = verse_omgeving("gezond")
+        _schrijf_creds(cred, resterend_min=300)
+        srv, url = _start_nepserver({"bron": "live", "five_hour": 12.0})
+        try:
+            _draai(cred, staat, claude, extra=["--server", url])
+        finally:
+            srv.shutdown()
+        log = _leeslog(staat)
+        u.check("server live -> OK-regel", "[OK]" in log and "live" in log, True)
+        u.check("server live -> geen waarschuwing", "[WAARSCHUWING]" in log, False)
+
+        # 13. Server meldt 'geweigerd' -> waarschuwing met de te nemen actie.
+        cred, staat = verse_omgeving("geweigerd")
+        _schrijf_creds(cred, resterend_min=300)
+        srv, url = _start_nepserver({"bron": "geweigerd", "five_hour": None})
+        try:
+            _draai(cred, staat, claude, extra=["--server", url])
+        finally:
+            srv.shutdown()
+        log = _leeslog(staat)
+        u.check("geweigerd -> WAARSCHUWING", "[WAARSCHUWING]" in log, True)
+        u.check("geweigerd -> noemt de oplossing", "claude auth login" in log, True)
+
+        # 14. Server onbereikbaar -> ook een waarschuwing.
+        cred, staat = verse_omgeving("serverweg")
+        _schrijf_creds(cred, resterend_min=300)
+        _draai(cred, staat, claude,
+               extra=["--server", "http://127.0.0.1:9/verbruik"])
+        u.check("server onbereikbaar -> WAARSCHUWING",
+                "[WAARSCHUWING]" in _leeslog(staat), True)
+
+        # 15. Controle uitgeschakeld -> gedraagt zich als voorheen.
+        cred, staat = verse_omgeving("geencheck")
+        _schrijf_creds(cred, resterend_min=300)
+        _draai(cred, staat, claude)   # _draai geeft standaard --server ""
+        log = _leeslog(staat)
+        u.check("zonder server -> gewoon OK", "[OK]" in log, True)
+        u.check("zonder server -> geen waarschuwing", "[WAARSCHUWING]" in log, False)
 
     finally:
         if args.houd:

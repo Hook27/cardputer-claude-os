@@ -42,6 +42,21 @@ Daarom:
   - na een mislukte poging bepaalt `claude auth status --json` of de
     login nog staat; dat is het enige betrouwbare signaal.
 
+### Gezondheidscontrole (na de storing van 2026-08-03)
+
+Een vers token is niet hetzelfde als een wérkend token: die dag bleef dit
+script uren `[OK] Token ververst` melden terwijl de API de credentials
+weigerde (401 met een `expiresAt` ver in de toekomst). We bewaakten dus of
+het token ververst werd, niet of het werkte.
+
+Daarom vraagt het script nu bij elke run aan de lokale verbruikserver hoe
+het gaat, en zet dat in dezelfde regel die je toch al leest. Gaat er iets
+mis, dan wordt het een `[WAARSCHUWING]` met de te nemen actie erbij.
+
+Bewust géén eigen API-call: we lezen de toestand van de server, die de call
+toch al doet. Een tweede poller zou het rate-limit-venster kunnen raken —
+precies waardoor het die dag misging.
+
 ### Resultaat
 
 Laatste regel op stdout is "RESULTAAT: <code>":
@@ -64,6 +79,8 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 
 # Standaardwaarden; alle paden zijn met vlaggen te overschrijven voor tests.
@@ -73,6 +90,9 @@ TIMEOUT_S = 120
 MAX_LOG_BYTES = 200 * 1024
 WAARSCHUW_DAGEN = 2
 BEWAAR_DEBUG = 5
+# Lokale verbruikserver, om te controleren of het token niet alleen vers maar
+# ook werkzaam is. Leeg maken (of --server "") schakelt die controle uit.
+SERVER_URL = "http://127.0.0.1:8091/verbruik"
 
 _HOME = os.path.expanduser("~")
 _CRED_PAD = os.path.join(_HOME, ".claude", ".credentials.json")
@@ -116,28 +136,66 @@ def schrijf_log(ctx, niveau, bericht):
     print(regel, file=sys.stderr)
 
 
-def heartbeat_nodig(ctx):
-    """Hoogstens 1x per uur een 'alles in orde'-regel.
+def heartbeat_nodig(ctx, niveau="OK"):
+    """Hoogstens 1x per uur een regel van dit niveau.
 
-    Zonder deze rem staan er 96 identieke OK-regels per dag in de log en
-    zie je de interessante regels niet meer staan.
+    Zonder deze rem staan er 96 identieke OK-regels per dag in de log en zie
+    je de interessante regels niet meer staan. Ook waarschuwingen gaan er
+    doorheen: een aanhoudend probleem hoort te blijven melden, maar per uur,
+    niet per kwartier.
+
+    Zoekt de meest recente regel van dit niveau en negeert wat ertussen staat.
+    (De eerdere versie stopte bij de eerste regel van een ánder niveau, wat
+    betekende dat één waarschuwing de OK-rem meteen weer vrijgaf.)
     """
+    patroon = r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[" + re.escape(niveau) + r"\]"
     try:
         with open(ctx.log, "r", encoding="utf-8") as f:
             regels = f.readlines()
     except OSError:
         return True
     for regel in reversed(regels):
-        m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[OK\]", regel)
+        m = re.match(patroon, regel)
         if m:
             try:
                 t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 return True
             return (datetime.now() - t).total_seconds() >= 3600
-        if regel.strip():
-            return True
     return True
+
+
+# --- gezondheid van de verbruikserver --------------------------------
+
+
+def server_toestand(url, timeout=4):
+    """Vraag de verbruikserver hoe het met hem gaat.
+
+    Bewust GEEN eigen API-call: we lezen de toestand van de server, die de
+    call toch al doet. Een tweede poller zou het rate-limit-venster kunnen
+    raken — precies waardoor het op 2026-08-03 misging.
+
+    Geeft ``(gezond, tekst)``. ``gezond`` is None wanneer er niets te zeggen
+    valt (controle uitgeschakeld), True bij verse cijfers, en False als de
+    server draait maar geen live data heeft of helemaal niet reageert.
+    """
+    if not url:
+        return None, ""
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return False, "verbruikserver reageert niet ({})".format(e)
+
+    bron = (data or {}).get("bron") or "?"
+    if bron == "live":
+        return True, "verbruikserver: live"
+    if bron == "geweigerd":
+        # Dit is het scenario dat we tot 2026-08-03 niet zagen: het token
+        # wordt keurig ververst, maar de API accepteert het niet meer.
+        return False, ("verbruikserver krijgt 'geweigerd' -- het token wordt "
+                       "wel ververst maar niet geaccepteerd. Nodig: claude auth login")
+    return False, "verbruikserver: geen live cijfers (bron '{}')".format(bron)
 
 
 def stop_met(code, exitcode=0):
@@ -300,6 +358,9 @@ def main():
     p.add_argument("--staat-map", default=_STAAT_MAP)
     p.add_argument("--claude", default=None, help="pad naar de claude-binary")
     p.add_argument("--timeout", type=int, default=TIMEOUT_S)
+    p.add_argument("--server", default=SERVER_URL,
+                   help="verbruikserver om de gezondheid bij op te vragen; "
+                        "leeg laten schakelt die controle uit")
     args = p.parse_args()
 
     ctx = Ctx(args.credentials, args.staat_map, args.claude)
@@ -335,9 +396,18 @@ def main():
 
     # --- 2. Is een refresh nodig? -------------------------------------
     if resterend_min > args.marge:
-        if heartbeat_nodig(ctx):
-            schrijf_log(ctx, "OK", "Token {} (tot {}); niets te doen.".format(
-                duur(resterend_min), klok(expires_at)))
+        # Een geldig token is niet hetzelfde als een wérkend token. Vraag de
+        # verbruikserver of hij er nog cijfers mee ophaalt; anders blijft dit
+        # script "niets te doen" melden terwijl het scherm al uren hangt.
+        gezond, gezondheidstekst = server_toestand(args.server)
+        if gezond is False:
+            if heartbeat_nodig(ctx, "WAARSCHUWING"):
+                schrijf_log(ctx, "WAARSCHUWING", "Token {} (tot {}), maar {}.".format(
+                    duur(resterend_min), klok(expires_at), gezondheidstekst))
+        elif heartbeat_nodig(ctx):
+            achtervoegsel = "; " + gezondheidstekst if gezondheidstekst else ""
+            schrijf_log(ctx, "OK", "Token {} (tot {}); niets te doen{}.".format(
+                duur(resterend_min), klok(expires_at), achtervoegsel))
         stop_met("geldig", 0)
 
     # --- 3. Kan de CLI überhaupt verversen? ---------------------------

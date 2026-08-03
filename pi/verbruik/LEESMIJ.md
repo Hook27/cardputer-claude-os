@@ -44,9 +44,20 @@ de klok van de Cardputer er niet toe doet.
  "bron": "live", "ts": 1785261682}
 ```
 
-`bron` is `live` (vers van de API), `gemeten`/`geen-token` (server kon niet
-verversen, dit zijn de laatst bekende cijfers) of `nep` (testserver). Het
-toestel toont dat in de kop, zodat je oude cijfers nooit voor verse aanziet.
+`bron` zegt hoe vers de cijfers zijn, en waarom niet:
+
+| waarde | betekenis | actie |
+|---|---|---|
+| `live` | vers van de API | — |
+| `gemeten` | ophalen mislukt; dit zijn de laatst bekende cijfers | afwachten |
+| `geweigerd` | er ís een token, maar de API accepteert het niet (401/403) | **`claude auth login` op de Pi** |
+| `geen-token` | geen bruikbaar credentialsbestand | inloggen |
+| `nep` | de offline testserver | — |
+
+Het toestel toont dit in de kop, zodat je oude cijfers nooit voor verse
+aanziet. `geweigerd` en `geen-token` staan er bewust apart in: een token met
+een expiry ver in de toekomst kan tóch geweigerd worden, en dan helpt
+afwachten niet.
 
 ## Fase 0 — offline testen (geen token nodig)
 
@@ -236,6 +247,13 @@ en push `config.py` naar het toestel.
 - Wat de timer deed staat in
   `~/.local/state/claude-token-refresh/ververs-claude-token.log`.
   Zie je daar `Nodig: claude auth login`, dan is dat het signaal.
+- **Die log bewaakt nu ook of het token wérkt, niet alleen of het vers is.**
+  Elke run vraagt de verbruikserver naar zijn toestand en zet dat in dezelfde
+  regel: `... niets te doen; verbruikserver: live`. Haalt de server geen
+  cijfers op, dan wordt het een `[WAARSCHUWING]` met de te nemen actie erbij.
+  Dat gat kostte op 2026-08-03 een halve dag: het token werd keurig ververst
+  terwijl de API het weigerde, en de log bleef `[OK]` melden. De controle
+  doet géén eigen API-call — hij leest de server, die de call toch al doet.
 - Diagnose per poging (CLI-debuglogs, momentopnames met vingerafdrukken —
   geen tokens) staat in `~/.local/state/claude-token-refresh/diagnose/`.
 - `exit 1` van de refresh-unit is normaal: het script gebruikt die code ook
