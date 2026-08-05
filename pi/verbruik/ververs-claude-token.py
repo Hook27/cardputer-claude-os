@@ -42,6 +42,26 @@ Daarom:
   - na een mislukte poging bepaalt `claude auth status --json` of de
     login nog staat; dat is het enige betrouwbare signaal.
 
+### Meting naar aanleiding van 2026-08-05
+
+Die dag ging de login op de Pi verloren. De vingerafdrukketen liet zien dat
+niets anders het token had geroteerd, en `refreshTokenExpiresAt` had nog 25
+dagen te gaan — en tóch antwoordde de server met
+`400: OAuth refresh token is no longer valid`.
+
+Het debuglog van de eerste poging wijst naar onszelf: de CLI meldt
+`Passes: Cache stale, ... refreshing in background` en het proces was 0,2 s
+later al weg, zonder iets weg te schrijven. Bereikte die achtergrondrefresh de
+server wél, dan roteerde het token daar en was het onze kopie die dood
+achterbleef — waarna de tweede poging de CLI de login liet wissen.
+
+Dat is een gevolgtrekking, geen bewijs. Daarom meet dit script nu eerst: een
+run die het bestand volledig ongemoeid laat krijgt de eigen uitkomst
+`onveranderd`, met de looptijd van het CLI-proces erbij. Valt dat samen met
+korte looptijden, dan klopt het verhaal en is "de CLI langer in leven houden"
+de juiste ingreep. Het gedrag is bewust nog niet aangepast — anders weten we
+straks niet welke verandering hielp.
+
 ### Gezondheidscontrole (na de storing van 2026-08-03)
 
 Een vers token is niet hetzelfde als een wérkend token: die dag bleef dit
@@ -64,7 +84,8 @@ Laatste regel op stdout is "RESULTAAT: <code>":
     geldig        token nog ruim geldig, niets gedaan            (exit 0)
     refresh-nodig refresh nodig, CLI niet gestart wegens --dry-run (exit 0)
     ververst      refresh gelukt, nieuwe expiry weggeschreven    (exit 0)
-    mislukt       CLI gedraaid maar expiry niet opgeschoven      (exit 1)
+    onveranderd   CLI gedraaid maar liet het bestand ongemoeid   (exit 1)
+    mislukt       CLI gedraaid, wel iets gewijzigd, geen nieuwe expiry (exit 1)
     gepauzeerd    pogingenlimiet voor dit venster bereikt        (exit 1)
     login-nodig   login weg of geweigerd: claude auth login      (exit 1)
     fout          credentialsbestand ontbreekt of is onleesbaar  (exit 1)
@@ -276,6 +297,46 @@ _DEBUG_PATROON = re.compile(
     r"oauth|invalid_grant|refresh_token|refresh token|token refresh|\b401\b|"
     r"\b403\b|Unauthorized|Forbidden|not logged in|credentials\.json|"
     r"claudeai-mcp|\[Bootstrap\]|Authorization", re.IGNORECASE)
+
+
+def cli_sporen(pad):
+    """Wat het CLI-debuglog zegt over de refreshpoging zelf.
+
+    Geeft ``(duur_s, achtergrond_gestart, oauth_gezien)``.
+
+    De duur is het verschil tussen de eerste en laatste tijdstempel in het log,
+    oftewel hoe lang het CLI-proces heeft geleefd. Dat is het getal waar het om
+    draait bij het vermoeden van 2026-08-05: de CLI start de refresh op de
+    achtergrond ("refreshing in background") en onze lege prompt geeft hem
+    verder niets te doen, dus hij kan vertrekken vóór die refresh geland is.
+    Bereikte de refresh de server toch, dan is het refresh-token daar geroteerd
+    en dus dood, terwijl het nieuwe nooit is opgeslagen — en dan sloopt de
+    vólgende poging de login.
+
+    Als stille no-ops samenvallen met een korte looptijd, klopt dat verhaal.
+    Zo niet, dan moeten we een andere kant op kijken.
+    """
+    try:
+        with open(pad, "r", encoding="utf-8", errors="replace") as f:
+            regels = f.readlines()
+    except OSError:
+        return None, False, False
+
+    stempels = []
+    for regel in regels:
+        m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)Z", regel)
+        if m:
+            try:
+                stempels.append(
+                    datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S.%f"))
+            except ValueError:
+                pass
+    duur = (stempels[-1] - stempels[0]).total_seconds() if len(stempels) >= 2 else None
+
+    tekst = "".join(regels).lower()
+    achtergrond = "refreshing in background" in tekst
+    oauth_gezien = ("oauth refresh" in tekst) or ("[bootstrap] fetching" in tekst)
+    return duur, achtergrond, oauth_gezien
 
 
 def debug_hoogtepunten(pad):
@@ -532,6 +593,33 @@ def main():
 
     for regel in debug_hoogtepunten(debug_pad):
         schrijf_log(ctx, "DEBUG", regel)
+
+    # Bleef het bestand volledig ongemoeid, dan is dat een eigen verhaal en
+    # geen gewone mislukking: de CLI heeft dan niets weggeschreven, maar kan de
+    # server wél bereikt hebben. Zie cli_sporen() voor waarom dat gevaarlijk
+    # is. Bewust nog GEEN ander gedrag — eerst meten hoe vaak dit gebeurt en
+    # of het samenvalt met een korte looptijd, anders weten we straks niet
+    # welke ingreep hielp.
+    if (na is not None
+            and na.get("expiresAt") == oauth.get("expiresAt")
+            and na.get("accessToken") == oauth.get("accessToken")
+            and na.get("refreshToken") == oauth.get("refreshToken")):
+        # NB: niet 'duur' als naam gebruiken -- dat is de functie hierboven, en
+        # een gelijknamige lokale variabele maakt die onbereikbaar in de hele
+        # functie (Python bepaalt dat bij het compileren, niet bij het uitvoeren).
+        looptijd, achtergrond, oauth_gezien = cli_sporen(debug_pad)
+        schrijf_log(ctx, "FOUT", (
+            "Poging {}/{}: de CLI draaide maar veranderde niets -- expiry en "
+            "beide tokens identiek. Looptijd CLI: {}; achtergrondrefresh "
+            "gestart: {}; OAuth-antwoord gezien: {}. Bereikte die refresh de "
+            "server wel, dan is het token nu dood en sloopt de volgende poging "
+            "de login. Debuglog: {}").format(
+                poging, args.max_pogingen,
+                "{:.2f} s".format(looptijd) if looptijd is not None else "onbekend",
+                "ja" if achtergrond else "nee",
+                "ja" if oauth_gezien else "nee",
+                debug_pad))
+        stop_met("onveranderd", 1)
 
     if na and (not na.get("refreshToken") or not na.get("accessToken")):
         schrijf_log(ctx, "FOUT", "De CLI heeft de login leeggemaakt (refresh-token "

@@ -62,6 +62,12 @@ if mode == "ververs":
     o["accessToken"] = o["accessToken"] + "-nieuw"
     o["refreshToken"] = o["refreshToken"] + "-nieuw"   # roteert, net als echt
     schrijf(d)
+elif mode == "rommelt":
+    # Wel iets aanraken, maar geen nieuwe expiry: dat is een echte mislukking
+    # en moet te onderscheiden zijn van een run die niets deed.
+    d = lees()
+    d["claudeAiOauth"]["accessToken"] += "-anders"
+    schrijf(d)
 elif mode == "wis":
     d = lees()
     d["claudeAiOauth"] = {"accessToken": "", "refreshToken": "",
@@ -256,13 +262,30 @@ def main():
         u.check("al verlopen, CLI ververst",
                 _draai(cred, staat, claude, mode="ververs")[0], "ververst")
 
-        # 5. CLI doet niets -> mislukt, mislukt, dan gepauzeerd. Dit is de
-        #    klep die na 26 juli is ingebouwd: nooit blijven doorrammen.
+        # 5. CLI raakt niets aan -> 'onveranderd', tweemaal, dan gepauzeerd.
+        #    De pogingenklep van 26 juli werkt onveranderd; alleen de uitkomst
+        #    heeft sinds 5 augustus een eigen naam, omdat een run die niets
+        #    wegschreef iets anders betekent dan een mislukte refresh.
         cred, staat = verse_omgeving("pauze")
         _schrijf_creds(cred, resterend_min=2)
-        u.check("poging 1 zonder effect", _draai(cred, staat, claude)[0], "mislukt")
-        u.check("poging 2 zonder effect", _draai(cred, staat, claude)[0], "mislukt")
+        u.check("poging 1 raakt niets aan", _draai(cred, staat, claude)[0], "onveranderd")
+        u.check("poging 2 raakt niets aan", _draai(cred, staat, claude)[0], "onveranderd")
         u.check("poging 3 -> gepauzeerd", _draai(cred, staat, claude)[0], "gepauzeerd")
+
+        # 5b. Wel iets gewijzigd maar geen nieuwe expiry -> echte mislukking.
+        cred, staat = verse_omgeving("rommel")
+        _schrijf_creds(cred, resterend_min=2)
+        u.check("wel gewijzigd, geen nieuwe expiry",
+                _draai(cred, staat, claude, mode="rommelt")[0], "mislukt")
+
+        # 5c. De no-op-regel moet de meetgegevens bevatten waarvoor hij bestaat.
+        cred, staat = verse_omgeving("meting")
+        _schrijf_creds(cred, resterend_min=2)
+        _draai(cred, staat, claude)
+        log = _leeslog(staat)
+        u.check("no-op logt de looptijd", "Looptijd CLI:" in log, True)
+        u.check("no-op logt de achtergrondrefresh",
+                "achtergrondrefresh gestart:" in log, True)
 
         # 6. CLI maakt de login leeg -> login-nodig (het scenario van 26 juli).
         cred, staat = verse_omgeving("wis")
