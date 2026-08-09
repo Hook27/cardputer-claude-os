@@ -15,3 +15,7 @@ buddy/device/wifi_event.py
 
 # Lokaal gearchiveerde Claude-gesprekken (niet naar GitHub)
 pi-temp-server-m5stack-monitor-sessie.md
+
+# Diagnose-prompt voor een nieuw gesprek: bevat de LAN- en Tailscale-adressen
+# van de Pi, die in 85a57ec juist uit de repo zijn gehaald. Blijft lokaal.
+pi/verbruik/diagnose-prompt.md
