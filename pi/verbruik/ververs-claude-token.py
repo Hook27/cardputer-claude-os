@@ -458,11 +458,12 @@ def start_cli(exe, werkmap, debug_pad, timeout_s, stdin_open_s):
         einde = time.monotonic() + stdin_open_s
         while time.monotonic() < einde and proc.poll() is None:
             time.sleep(0.1)
-        try:
-            proc.stdin.close()
-        except (OSError, ValueError):
-            pass  # proces was er al niet meer
-        proc.communicate(timeout=timeout_s)
+        # Stdin niet zelf sluiten: communicate() doet dat, en op Linux flust
+        # het eerst -- op een al gesloten pijp geeft dat
+        # "ValueError: flush of closed file". Op Windows loopt dat via een
+        # ander codepad, dus dat verschil viel daar niet op.
+        # Lege invoer betekent hier: niets schrijven, alleen sluiten.
+        proc.communicate(input=b"", timeout=timeout_s)
     except subprocess.TimeoutExpired:
         proc.kill()
         try:

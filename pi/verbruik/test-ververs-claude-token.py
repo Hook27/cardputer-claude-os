@@ -158,7 +158,13 @@ def _draai(cred, staat, claude, mode="niets", extra=None):
     for regel in uit.splitlines():
         if regel.startswith("RESULTAAT:"):
             return regel.split(":", 1)[1].strip(), r.returncode
-    return "(geen resultaat: {})".format(uit.strip()[:120]), r.returncode
+    # Geen resultaat betekent bijna altijd: het script is gecrasht. Toon dan de
+    # staart van stderr, want een kale "(geen resultaat: )" verzwijgt juist de
+    # traceback die je nodig hebt -- dat kostte een ronde heen en weer toen de
+    # suite op Linux omviel en op Windows niet.
+    fout = r.stderr.decode("utf-8", "replace").strip().splitlines()
+    staart = " | ".join(f.strip() for f in fout[-3:]) if fout else uit.strip()
+    return "(geen resultaat: {})".format(staart[:300]), r.returncode
 
 
 def _start_nepserver(payload):
