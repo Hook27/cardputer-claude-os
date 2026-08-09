@@ -37,7 +37,7 @@ _SCRIPT = os.path.join(_HIER, "ververs-claude-token.py")
 # het enige signaal waar het echte script op afgaat), bij 'wis' maakt hij
 # de login leeg zoals de echte CLI op 2026-07-26 deed.
 _FAKE_CLAUDE = r'''
-import json, os, sys
+import json, os, sys, threading, time
 
 mode = os.environ.get("FAKE_MODE", "niets")
 cred = os.environ["FAKE_CRED"]
@@ -62,6 +62,29 @@ if mode == "ververs":
     o["accessToken"] = o["accessToken"] + "-nieuw"
     o["refreshToken"] = o["refreshToken"] + "-nieuw"   # roteert, net als echt
     schrijf(d)
+elif mode == "async-refresh":
+    # Bootst de echte CLI na: de refresh landt pas na 0,4 s, en wordt alleen
+    # weggeschreven als het proces dan nog leeft. Sluit de aanroeper stdin
+    # meteen, dan is dat niet zo en verandert er niets -- precies de race die
+    # op 2026-08-09 de login kostte.
+    geland = {"ok": False}
+
+    def _landt():
+        time.sleep(0.4)
+        geland["ok"] = True
+
+    threading.Thread(target=_landt, daemon=True).start()
+    try:
+        sys.stdin.read()      # wacht tot de pijp sluit, net als bij -p
+    except Exception:
+        pass
+    if geland["ok"]:
+        d = lees()
+        o = d["claudeAiOauth"]
+        o["expiresAt"] = o["expiresAt"] + 8 * 3600 * 1000
+        o["accessToken"] = o["accessToken"] + "-nieuw"
+        o["refreshToken"] = o["refreshToken"] + "-nieuw"
+        schrijf(d)
 elif mode == "rommelt":
     # Wel iets aanraken, maar geen nieuwe expiry: dat is een echte mislukking
     # en moet te onderscheiden zijn van een run die niets deed.
@@ -123,9 +146,11 @@ def _draai(cred, staat, claude, mode="niets", extra=None):
     omgeving = dict(os.environ, FAKE_MODE=mode, FAKE_CRED=cred)
     # --server "" houdt deze tests hermetisch: zonder dat zou het script de
     # echte verbruikserver op poort 8091 van de testmachine proberen.
+    # --stdin-open 0 houdt de suite snel; de tests die de wachttijd zélf
+    # onderzoeken zetten hem expliciet hoger.
     cmd = [sys.executable, _SCRIPT, "--credentials", cred,
            "--staat-map", staat, "--claude", claude, "--timeout", "60",
-           "--server", ""]
+           "--server", "", "--stdin-open", "0"]
     if extra:
         cmd += extra
     r = subprocess.run(cmd, capture_output=True, env=omgeving, timeout=180)
@@ -278,12 +303,27 @@ def main():
         u.check("wel gewijzigd, geen nieuwe expiry",
                 _draai(cred, staat, claude, mode="rommelt")[0], "mislukt")
 
+        # 5d. De kern van de fix van 2026-08-09. De nep-CLI schrijft het nieuwe
+        #     token pas na 0,4 s weg, en alleen als hij dan nog leeft. Sluiten
+        #     we stdin meteen, dan mislukt dat -- houden we hem open, dan lukt
+        #     het. Dat is precies de race die drie logins kostte.
+        cred, staat = verse_omgeving("racekwijt")
+        _schrijf_creds(cred, resterend_min=2)
+        u.check("stdin meteen dicht -> refresh gaat verloren",
+                _draai(cred, staat, claude, mode="async-refresh")[0], "onveranderd")
+
+        cred, staat = verse_omgeving("racegewonnen")
+        _schrijf_creds(cred, resterend_min=2)
+        u.check("stdin openhouden -> refresh landt",
+                _draai(cred, staat, claude, mode="async-refresh",
+                       extra=["--stdin-open", "2"])[0], "ververst")
+
         # 5c. De no-op-regel moet de meetgegevens bevatten waarvoor hij bestaat.
         cred, staat = verse_omgeving("meting")
         _schrijf_creds(cred, resterend_min=2)
         _draai(cred, staat, claude)
         log = _leeslog(staat)
-        u.check("no-op logt de looptijd", "Looptijd CLI:" in log, True)
+        u.check("no-op logt de looptijd", "Proces leefde" in log, True)
         u.check("no-op logt de achtergrondrefresh",
                 "achtergrondrefresh gestart:" in log, True)
 

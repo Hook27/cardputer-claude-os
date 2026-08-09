@@ -55,12 +55,18 @@ later al weg, zonder iets weg te schrijven. Bereikte die achtergrondrefresh de
 server wél, dan roteerde het token daar en was het onze kopie die dood
 achterbleef — waarna de tweede poging de CLI de login liet wissen.
 
-Dat is een gevolgtrekking, geen bewijs. Daarom meet dit script nu eerst: een
-run die het bestand volledig ongemoeid laat krijgt de eigen uitkomst
-`onveranderd`, met de looptijd van het CLI-proces erbij. Valt dat samen met
-korte looptijden, dan klopt het verhaal en is "de CLI langer in leven houden"
-de juiste ingreep. Het gedrag is bewust nog niet aangepast — anders weten we
-straks niet welke verandering hielp.
+Op 2026-08-09 gebeurde het opnieuw, en toen gaf het volledige debuglog de
+doorslag. De CLI meldt letterlijk "Starting background startup prefetches",
+"refreshing in background" en "running fully async (nonblocking)", en begon
+**68 ms** na het versturen van het verzoek al af te sluiten. De regel
+`[claudeai-mcp] Fetching from .../v1/mcp_servers` — die in een geslaagde run
+wél staat — ontbrak volledig: er is nooit iets teruggekomen.
+
+Vandaar `start_cli()`: stdin blijft een paar seconden open, zodat het proces
+op zijn prompt wacht terwijl die achtergrondrefresh landt. Een run die het
+bestand tóch ongemoeid laat krijgt nog steeds de eigen uitkomst `onveranderd`,
+en de looptijd wordt nu ook bij een geslaagde refresh gelogd — dat
+vergelijkingspunt ontbrak, waardoor de eerste meting stuurloos was.
 
 ### Gezondheidscontrole (na de storing van 2026-08-03)
 
@@ -114,6 +120,9 @@ BEWAAR_DEBUG = 5
 # Lokale verbruikserver, om te controleren of het token niet alleen vers maar
 # ook werkzaam is. Leeg maken (of --server "") schakelt die controle uit.
 SERVER_URL = "http://127.0.0.1:8091/verbruik"
+# Seconden dat we stdin openhouden nadat de CLI is gestart. Zie start_cli()
+# voor waarom dat nodig is; ruim genomen, want de kosten zijn nul.
+STDIN_OPEN_S = 5.0
 # Een verbindingsfout mag een tweede kans krijgen: vlak na een herstart is de
 # poort nog niet open, en een loos alarm ondermijnt de bewaking.
 SERVER_POGINGEN = 2
@@ -415,6 +424,55 @@ def is_ingelogd(exe, werkmap):
         return None
 
 
+def start_cli(exe, werkmap, debug_pad, timeout_s, stdin_open_s):
+    """Start de CLI met een lege prompt, maar sluit stdin niet meteen.
+
+    De CLI vuurt zijn OAuth-refresh af als achtergrondtaak en wacht daar niet
+    op — het debuglog zegt het met zoveel woorden: "Starting background startup
+    prefetches", "refreshing in background", "running fully async
+    (nonblocking)". Met een stdin die direct sluit heeft hij daarna niets meer
+    te doen en vertrekt hij binnen een halve seconde. Op 2026-08-09 begon het
+    afsluiten **68 ms** nadat het verzoek de deur uit was, en een retour naar
+    api.anthropic.com duurt vanaf een Pi een veelvoud daarvan.
+
+    Landt het antwoord te laat, dan heeft de server het refresh-token wél
+    geroteerd terwijl wij het nieuwe nooit opslaan — en dan is onze kopie dood.
+    De volgende poging biedt dat dode token aan, krijgt een 400, en de CLI wist
+    de login. Dat kostte drie logins in een week.
+
+    Door de pijp een paar seconden open te houden blijft het proces wachten op
+    zijn prompt en krijgt die achtergrondrefresh de tijd om te landen en
+    weggeschreven te worden. Er gaat nog steeds geen prompt naartoe, dus nog
+    steeds geen model-call, geen tokenverbruik en geen nieuw 5-uursvenster.
+
+    Geeft ``(exitcode, looptijd_s)``. Gooit ``subprocess.TimeoutExpired`` door.
+    """
+    begin = time.monotonic()
+    proc = subprocess.Popen(
+        [exe, "-p", "--no-session-persistence", "--debug-file", debug_pad],
+        cwd=werkmap, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        # In stapjes wachten, zodat we niet nodeloos blijven zitten als de CLI
+        # om een andere reden al klaar is.
+        einde = time.monotonic() + stdin_open_s
+        while time.monotonic() < einde and proc.poll() is None:
+            time.sleep(0.1)
+        try:
+            proc.stdin.close()
+        except (OSError, ValueError):
+            pass  # proces was er al niet meer
+        proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.communicate()
+        except Exception:
+            pass
+        raise
+    return proc.returncode, time.monotonic() - begin
+
+
 def duur(minuten):
     if minuten < 0:
         return "{:.0f} min geleden verlopen".format(abs(minuten))
@@ -441,6 +499,9 @@ def main():
     p.add_argument("--staat-map", default=_STAAT_MAP)
     p.add_argument("--claude", default=None, help="pad naar de claude-binary")
     p.add_argument("--timeout", type=int, default=TIMEOUT_S)
+    p.add_argument("--stdin-open", type=float, default=STDIN_OPEN_S,
+                   help="seconden dat stdin openblijft, zodat de CLI niet "
+                        "vertrekt voor zijn achtergrondrefresh geland is")
     p.add_argument("--server", default=SERVER_URL,
                    help="verbruikserver om de gezondheid bij op te vragen; "
                         "leeg laten schakelt die controle uit")
@@ -546,10 +607,8 @@ def main():
     schrijf_momentopname(ctx, oauth, "voor", pogingnaam)
 
     try:
-        r = subprocess.run(
-            [exe, "-p", "--no-session-persistence", "--debug-file", debug_pad],
-            cwd=ctx.werkmap, input=b"", capture_output=True, timeout=args.timeout)
-        exitcode = r.returncode
+        exitcode, cli_looptijd = start_cli(
+            exe, ctx.werkmap, debug_pad, args.timeout, args.stdin_open)
     except subprocess.TimeoutExpired:
         schrijf_log(ctx, "FOUT", "CLI reageerde niet binnen {} s en is "
                     "afgebroken.".format(args.timeout))
@@ -574,8 +633,11 @@ def main():
     ruim_debuglogs_op(ctx)
 
     if na and na.get("expiresAt") and int(na["expiresAt"]) > expires_at:
-        schrijf_log(ctx, "OK", "Token ververst; nu geldig tot {}.".format(
-            klok(int(na["expiresAt"]))))
+        # Looptijd meeloggen, ook bij succes: zonder dat vergelijkingspunt zegt
+        # het getal bij een mislukking niets. Dat gat zat in de meting van
+        # 2026-08-05 en maakte die stuurloos.
+        schrijf_log(ctx, "OK", "Token ververst; nu geldig tot {} (CLI {:.2f} s).".format(
+            klok(int(na["expiresAt"])), cli_looptijd))
         schrijf_status(ctx, int(na["expiresAt"]), 0)
         stop_met("ververst", 0)
 
@@ -607,15 +669,15 @@ def main():
         # NB: niet 'duur' als naam gebruiken -- dat is de functie hierboven, en
         # een gelijknamige lokale variabele maakt die onbereikbaar in de hele
         # functie (Python bepaalt dat bij het compileren, niet bij het uitvoeren).
-        looptijd, achtergrond, oauth_gezien = cli_sporen(debug_pad)
+        logspan, achtergrond, oauth_gezien = cli_sporen(debug_pad)
         schrijf_log(ctx, "FOUT", (
             "Poging {}/{}: de CLI draaide maar veranderde niets -- expiry en "
-            "beide tokens identiek. Looptijd CLI: {}; achtergrondrefresh "
-            "gestart: {}; OAuth-antwoord gezien: {}. Bereikte die refresh de "
-            "server wel, dan is het token nu dood en sloopt de volgende poging "
-            "de login. Debuglog: {}").format(
-                poging, args.max_pogingen,
-                "{:.2f} s".format(looptijd) if looptijd is not None else "onbekend",
+            "beide tokens identiek. Proces leefde {:.2f} s, logde {}; "
+            "achtergrondrefresh gestart: {}; OAuth-antwoord gezien: {}. "
+            "Bereikte die refresh de server wel, dan is het token nu dood en "
+            "sloopt de volgende poging de login. Debuglog: {}").format(
+                poging, args.max_pogingen, cli_looptijd,
+                "{:.2f} s".format(logspan) if logspan is not None else "onbekend",
                 "ja" if achtergrond else "nee",
                 "ja" if oauth_gezien else "nee",
                 debug_pad))
