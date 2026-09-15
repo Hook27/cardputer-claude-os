@@ -11,7 +11,10 @@ logrem vergeleek de verkeerde velden waardoor de journal volliep.
 
 import importlib.util
 import os
+import shutil
 import sys
+import tempfile
+import time
 
 _HIER = os.path.dirname(os.path.abspath(__file__))
 
@@ -53,14 +56,25 @@ class NepAntwoord:
         return self.reeks[min(self.aanroepen - 1, len(self.reeks) - 1)]
 
 
-def _bouw(reeks, cache_s=300):
-    """Verbruik-instantie met nep-token en nep-API, plus de opgevangen logregels."""
+def _bouw(reeks, cache_s=300, cred_pad="/bestaat/niet"):
+    """Verbruik-instantie met nep-token en nep-API, plus de opgevangen logregels.
+
+    Het token komt altijd uit de nepfunctie; ``cred_pad`` doet alleen mee voor
+    de test die kijkt of de server een gewijzigd bestand opmerkt.
+    """
     srv._lees_token = lambda pad: ("nep-token", None, None)
     nep = NepAntwoord(reeks)
     srv._haal_verbruik = nep
     regels = []
     srv._log = lambda *a: regels.append(" ".join(str(x) for x in a))
-    return srv.Verbruik(cred_pad="/bestaat/niet", cache_s=cache_s), nep, regels
+    return srv.Verbruik(cred_pad=cred_pad, cache_s=cache_s), nep, regels
+
+
+def _schrijf(pad, inhoud):
+    """Nep-credentialsbestand wijzigen. Andere lengte = gegarandeerd andere
+    vingerafdruk, ook als mtime op dit bestandssysteem grof is."""
+    with open(pad, "w", encoding="utf-8") as f:
+        f.write(inhoud)
 
 
 def _forceer_nieuwe_poging(v, negeer_pauze=False):
@@ -152,6 +166,51 @@ def main():
     u.check("Retry-After ontbreekt -> None", srv._retry_after(NepFout(None)), None)
     datum = srv._retry_after(NepFout("Wed, 21 Oct 2099 07:28:00 GMT"))
     u.check("Retry-After als datum -> getal", isinstance(datum, int) and datum > 0, True)
+
+    # --- een nieuwe login oppikken (het herstartgedoe van 2026-09-15) ----
+    # Toen zat de server in een 429-wachttijd van een uur, logde je opnieuw in,
+    # en gebeurde er niets tot je hem herstartte.
+    map_ = tempfile.mkdtemp(prefix="test-verbruikserver-")
+    try:
+        cred = os.path.join(map_, "credentials.json")
+
+        # 11. Controle: zonder wijziging blijft de wachttijd gewoon staan.
+        _schrijf(cred, "oud")
+        v, nep, _ = _bouw([R429, GOED], cred_pad=cred)
+        v.stand()
+        v._laatste_poging -= 1000          # lang geleden, maar pauze loopt nog
+        v.stand()
+        u.check("geen wijziging -> wachttijd blijft", nep.aanroepen, 1)
+
+        # 12. Gewijzigd bestand -> wachttijd vervalt, meteen opnieuw ophalen.
+        _schrijf(cred, "nieuwe login")
+        v.stand()
+        u.check("nieuwe login -> meteen opnieuw ophalen", nep.aanroepen, 2)
+        u.check("nieuwe login -> weer live", v._bron, "live")
+        u.check("nieuwe login -> backoff eraf", (v._backoff_s, v._pauze_tot), (0, 0.0))
+
+        # 13. Maar niet binnen MIN_NA_WIJZIGING_S na de vorige poging: een
+        #     reeks schrijfacties mag het rate-limit-venster niet raken.
+        _schrijf(cred, "oud")
+        v, nep, _ = _bouw([R429, GOED], cred_pad=cred)
+        v.stand()                           # 429, poging is 'nu'
+        _schrijf(cred, "direct daarna")
+        v.stand()
+        u.check("wijziging binnen 3 min -> nog niet", nep.aanroepen, 1)
+
+        # 14. Met live cijfers is een gewijzigd bestand de gewone refresh van
+        #     elke acht uur: geen extra API-call.
+        _schrijf(cred, "oud")
+        v, nep, _ = _bouw([GOED], cred_pad=cred)
+        v.stand()
+        # Voorbij de 3-minutenrem maar binnen de 5-minutencache: zo kan alléén
+        # de live-controle voorkomen dat er een extra call komt.
+        v._laatste_poging = time.time() - 200
+        _schrijf(cred, "gewone refresh")
+        v.stand()
+        u.check("live + gewijzigd bestand -> geen extra call", nep.aanroepen, 1)
+    finally:
+        shutil.rmtree(map_, ignore_errors=True)
 
     print("\n{} goed, {} fout".format(u.goed, u.fout))
     return 0 if u.fout == 0 else 1

@@ -8,8 +8,13 @@ echte omgeving aan te raken:
   * raakt ~/.claude/ nooit aan en gaat het netwerk niet op.
 
 Dit is de test die je draait vóór je de systemd-timer op de Pi aanzet: de
-gevaarlijke paden (pogingenlimiet, leeggemaakte login, verlopen
-refresh-token) worden hier uitgelokt in plaats van in productie.
+gevaarlijke paden (wachtschema, leeggemaakte login, verlopen refresh-token,
+een refresh die te traag terugkomt) worden hier uitgelokt in plaats van in
+productie.
+
+Draai hem op de Pi, niet op Windows: subprocess- en stdin-gedrag verschillen,
+en dat heeft het script al eens lamgelegd terwijl de suite op Windows slaagde.
+Reken op ruim een halve minuut; de trage-refreshtest wacht echt acht seconden.
 
     python3 test-ververs-claude-token.py
     python3 test-ververs-claude-token.py --houd   # temp-map laten staan
@@ -38,6 +43,7 @@ _SCRIPT = os.path.join(_HIER, "ververs-claude-token.py")
 # de login leeg zoals de echte CLI op 2026-07-26 deed.
 _FAKE_CLAUDE = r'''
 import json, os, sys, threading, time
+from datetime import datetime, timezone
 
 mode = os.environ.get("FAKE_MODE", "niets")
 cred = os.environ["FAKE_CRED"]
@@ -47,6 +53,20 @@ if "auth" in sys.argv and "status" in sys.argv:
     print(json.dumps({"loggedIn": ingelogd}))
     sys.exit(0)
 
+debug_pad = None
+if "--debug-file" in sys.argv:
+    i = sys.argv.index("--debug-file")
+    if i + 1 < len(sys.argv):
+        debug_pad = sys.argv[i + 1]
+
+def dbg(tekst):
+    # Zelfde vorm als het echte debuglog: ISO-tijdstempel met Z, dan [DEBUG].
+    if not debug_pad:
+        return
+    stempel = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    with open(debug_pad, "a", encoding="utf-8") as f:
+        f.write("{} [DEBUG] {}\n".format(stempel, tekst))
+
 def lees():
     with open(cred, encoding="utf-8") as f:
         return json.load(f)
@@ -55,13 +75,43 @@ def schrijf(d):
     with open(cred, "w", encoding="utf-8") as f:
         json.dump(d, f)
 
-if mode == "ververs":
+def ververs_token():
     d = lees()
     o = d["claudeAiOauth"]
     o["expiresAt"] = o["expiresAt"] + 8 * 3600 * 1000
     o["accessToken"] = o["accessToken"] + "-nieuw"
     o["refreshToken"] = o["refreshToken"] + "-nieuw"   # roteert, net als echt
     schrijf(d)
+    # Pas na de tokenstap komen deze regels -- zo zag het echte debuglog van
+    # de geslaagde run op 2026-09-14 eruit.
+    dbg("[claudeai-mcp] Fetching from https://api.anthropic.com/v1/mcp_servers?limit=1000")
+    dbg("[Bootstrap] Fetch ok")
+
+# Elke run begint zoals de echte: bootstrap verstuurd, plus de Passes-regel
+# die de oude marker ten onrechte voor een OAuth-refresh aanzag.
+dbg("[Bootstrap] Fetching")
+dbg("Passes: Cache stale, returning cached data and refreshing in background")
+
+if mode == "ververs":
+    ververs_token()
+elif mode == "traag":
+    # De refresh komt pas na FAKE_TRAAG_S seconden terug en wordt dan meteen
+    # weggeschreven, maar alleen als het proces dan nog leeft. Zo ging het op
+    # 2026-09-14: stdin ging na vijf seconden dicht, het antwoord kwam later.
+    wachttijd = float(os.environ.get("FAKE_TRAAG_S", "8"))
+    leeft = {"ja": True}
+
+    def _antwoord():
+        time.sleep(wachttijd)
+        if leeft["ja"]:
+            ververs_token()
+
+    threading.Thread(target=_antwoord, daemon=True).start()
+    try:
+        sys.stdin.read()      # wacht op de prompt, net als de echte CLI bij -p
+    except Exception:
+        pass
+    leeft["ja"] = False
 elif mode == "async-refresh":
     # Bootst de echte CLI na: de refresh landt pas na 0,4 s, en wordt alleen
     # weggeschreven als het proces dan nog leeft. Sluit de aanroeper stdin
@@ -79,12 +129,7 @@ elif mode == "async-refresh":
     except Exception:
         pass
     if geland["ok"]:
-        d = lees()
-        o = d["claudeAiOauth"]
-        o["expiresAt"] = o["expiresAt"] + 8 * 3600 * 1000
-        o["accessToken"] = o["accessToken"] + "-nieuw"
-        o["refreshToken"] = o["refreshToken"] + "-nieuw"
-        schrijf(d)
+        ververs_token()
 elif mode == "rommelt":
     # Wel iets aanraken, maar geen nieuwe expiry: dat is een echte mislukking
     # en moet te onderscheiden zijn van een run die niets deed.
@@ -141,9 +186,11 @@ def _schrijf_creds(pad, resterend_min, refresh_token="rt-abc",
         json.dump({"claudeAiOauth": oauth}, f)
 
 
-def _draai(cred, staat, claude, mode="niets", extra=None):
+def _draai(cred, staat, claude, mode="niets", extra=None, omgeving_extra=None):
     """Start het echte script en geef de RESULTAAT-code terug."""
     omgeving = dict(os.environ, FAKE_MODE=mode, FAKE_CRED=cred)
+    if omgeving_extra:
+        omgeving.update(omgeving_extra)
     # --server "" houdt deze tests hermetisch: zonder dat zou het script de
     # echte verbruikserver op poort 8091 van de testmachine proberen.
     # --stdin-open 0 houdt de suite snel; de tests die de wachttijd zélf
@@ -230,6 +277,30 @@ def _leeslog(staat):
         return ""
 
 
+def _lees_status(staat):
+    try:
+        with open(os.path.join(staat, "ververs-status.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _wachttijd_min(staat):
+    """Minuten tussen nu en de geplande volgende poging, afgerond."""
+    st = _lees_status(staat)
+    if "volgende_poging" not in st:
+        return None
+    return round((st["volgende_poging"] - time.time()) / 60)
+
+
+def _spoel_door(staat):
+    """Doe alsof de wachttijd voorbij is, zonder er echt op te wachten."""
+    st = _lees_status(staat)
+    st["volgende_poging"] = int(time.time()) - 3600
+    with open(os.path.join(staat, "ververs-status.json"), "w", encoding="utf-8") as f:
+        json.dump(st, f)
+
+
 class Uitslag:
     def __init__(self):
         self.goed = 0
@@ -293,15 +364,77 @@ def main():
         u.check("al verlopen, CLI ververst",
                 _draai(cred, staat, claude, mode="ververs")[0], "ververst")
 
-        # 5. CLI raakt niets aan -> 'onveranderd', tweemaal, dan gepauzeerd.
-        #    De pogingenklep van 26 juli werkt onveranderd; alleen de uitkomst
-        #    heeft sinds 5 augustus een eigen naam, omdat een run die niets
-        #    wegschreef iets anders betekent dan een mislukte refresh.
-        cred, staat = verse_omgeving("pauze")
+        # 5. Geen permanente pauze meer (storing 2026-09-14). Na elke mislukte
+        #    poging een oplopende wachttijd -- 15, 60, 120, 240, 240 min -- en
+        #    ook na vijf mislukkingen blijft hij het proberen zolang de login
+        #    heel is. Vroeger was het na twee pogingen afgelopen, en dat maakte
+        #    van een hapering een storing van dertig uur.
+        cred, staat = verse_omgeving("wachtschema")
         _schrijf_creds(cred, resterend_min=2)
         u.check("poging 1 raakt niets aan", _draai(cred, staat, claude)[0], "onveranderd")
-        u.check("poging 2 raakt niets aan", _draai(cred, staat, claude)[0], "onveranderd")
-        u.check("poging 3 -> gepauzeerd", _draai(cred, staat, claude)[0], "gepauzeerd")
+        u.check("direct daarna -> wacht", _draai(cred, staat, claude)[0], "wacht")
+        wachttijden = [_wachttijd_min(staat)]
+        for _ in range(4):
+            _spoel_door(staat)
+            _draai(cred, staat, claude)
+            wachttijden.append(_wachttijd_min(staat))
+        u.check("wachttijden lopen op tot plafond", wachttijden, [15, 60, 120, 240, 240])
+        _spoel_door(staat)
+        u.check("na 5 mislukkingen gewoon poging 6",
+                _draai(cred, staat, claude)[0], "onveranderd")
+
+        # 5a. Een mislukking gevolgd door een geslaagde poging: teller op nul.
+        cred, staat = verse_omgeving("herstel")
+        _schrijf_creds(cred, resterend_min=2)
+        _draai(cred, staat, claude)
+        _spoel_door(staat)
+        u.check("na mislukking lukt het alsnog",
+                _draai(cred, staat, claude, mode="ververs")[0], "ververst")
+        u.check("herstel zet de teller op nul", _lees_status(staat).get("pogingen"), 0)
+
+        # 5e. Een nieuw token (bijv. na handmatig inloggen) begint met een
+        #     schone lei, ook als de wachttijd van het oude nog loopt.
+        cred, staat = verse_omgeving("nieuwelogin")
+        _schrijf_creds(cred, resterend_min=2)
+        _draai(cred, staat, claude)
+        _schrijf_creds(cred, resterend_min=3, access_token="at-nieuw",
+                       refresh_token="rt-nieuw")
+        u.check("nieuw token -> meteen proberen",
+                _draai(cred, staat, claude)[0], "onveranderd")
+
+        # 5f. Een statusbestand van de vorige versie (zonder volgende_poging)
+        #     mag de oude permanente pauze niet voortzetten. Zo staat het op de
+        #     Pi na de storing van 14 september.
+        cred, staat = verse_omgeving("oudestatus")
+        _schrijf_creds(cred, resterend_min=2)
+        with open(cred, encoding="utf-8") as f:
+            oude_expiry = json.load(f)["claudeAiOauth"]["expiresAt"]
+        os.makedirs(staat, exist_ok=True)
+        with open(os.path.join(staat, "ververs-status.json"), "w", encoding="utf-8") as f:
+            json.dump({"venster": oude_expiry, "pogingen": 2}, f)
+        u.check("oude pauze vervalt", _draai(cred, staat, claude)[0], "onveranderd")
+
+        # 5g. De kern van de fix van 2026-09-15. Het antwoord op de refresh komt
+        #     pas na 8 s. Met de oude vaste 5 s gaat het verloren; met wachten
+        #     op het bestand (maximum 30 s) landt het -- en dan stopt het script
+        #     meteen in plaats van de volle 30 s uit te zitten.
+        traag = {"FAKE_TRAAG_S": "8"}
+        cred, staat = verse_omgeving("traagoud")
+        _schrijf_creds(cred, resterend_min=2)
+        u.check("traag antwoord, stdin 5 s -> verloren",
+                _draai(cred, staat, claude, mode="traag",
+                       extra=["--stdin-open", "5"], omgeving_extra=traag)[0],
+                "onveranderd")
+
+        cred, staat = verse_omgeving("traagnieuw")
+        _schrijf_creds(cred, resterend_min=2)
+        begin = time.monotonic()
+        uitkomst = _draai(cred, staat, claude, mode="traag",
+                          extra=["--stdin-open", "30"], omgeving_extra=traag)[0]
+        looptijd = time.monotonic() - begin
+        u.check("traag antwoord, wachten -> landt", uitkomst, "ververst")
+        u.check("stopt zodra token er is (< 20 s)", looptijd < 20, True)
+        u.check("OK-regel noemt tijd tot token", "nieuw token na" in _leeslog(staat), True)
 
         # 5b. Wel iets gewijzigd maar geen nieuwe expiry -> echte mislukking.
         cred, staat = verse_omgeving("rommel")
@@ -324,14 +457,21 @@ def main():
                 _draai(cred, staat, claude, mode="async-refresh",
                        extra=["--stdin-open", "2"])[0], "ververst")
 
-        # 5c. De no-op-regel moet de meetgegevens bevatten waarvoor hij bestaat.
+        # 5c. De no-op-regel moet de meetgegevens bevatten waarvoor hij bestaat,
+        #     en mag niets meer beweren wat hij niet kan bewijzen. Het nep-
+        #     debuglog bevat hier bewust "[Bootstrap] Fetching" en de Passes-
+        #     regel -- precies waarop de oude markers op 2026-09-14 "ja" logden.
         cred, staat = verse_omgeving("meting")
         _schrijf_creds(cred, resterend_min=2)
         _draai(cred, staat, claude)
         log = _leeslog(staat)
-        u.check("no-op logt de looptijd", "Proces leefde" in log, True)
-        u.check("no-op logt de achtergrondrefresh",
-                "achtergrondrefresh gestart:" in log, True)
+        u.check("no-op logt de looptijd", "CLI liep" in log, True)
+        u.check("no-op: connectors-marker = nee",
+                "claude.ai-connectors opgehaald: nee" in log, True)
+        u.check("no-op: niet voorbij tokenstap", "niet voorbij de tokenstap" in log, True)
+        u.check("geen valse OAuth-markers meer",
+                "achtergrondrefresh" in log or "OAuth-antwoord" in log, False)
+        u.check("no-op noemt volgende poging", "volgende poging om" in log, True)
 
         # 6. CLI maakt de login leeg -> login-nodig (het scenario van 26 juli).
         cred, staat = verse_omgeving("wis")

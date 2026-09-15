@@ -186,15 +186,19 @@ service is dan nog nodig.
 
 Beide tests raken je echte token niet aan (nep-credentials, nep-CLI,
 nep-server, geen netwerk) en lokken juist de gevaarlijke paden uit:
-pogingenlimiet, leeggemaakte login, verlopen refresh-token, rate-limit-backoff
-en een server die niet reageert.
+wachtschema na mislukkingen, een refresh die te traag terugkomt, leeggemaakte
+login, verlopen refresh-token, rate-limit-backoff, een nieuwe login tijdens een
+wachttijd en een server die niet reageert. Draai ze **hier op de Pi**, niet op
+Windows: subprocess-gedrag verschilt, en dat heeft het refresh-script al eens
+lamgelegd terwijl de suite op Windows slaagde.
 
 ```bash
 python3 ~/claude-verbruik/test-ververs-claude-token.py
 python3 ~/claude-verbruik/test-verbruik-server.py
 ```
 
-Verwacht: `24 goed, 0 fout` en `15 goed, 0 fout`. Daarna één echte,
+Verwacht: `41 goed, 0 fout` en `21 goed, 0 fout`. De eerste duurt ruim een
+halve minuut, omdat de trage-refreshtest echt acht seconden wacht. Daarna één echte,
 ongevaarlijke controle —
 `--dry-run` bepaalt wel de actie maar start de CLI niet:
 
@@ -288,4 +292,40 @@ en push `config.py` naar het toestel.
 - Diagnose per poging (CLI-debuglogs, momentopnames met vingerafdrukken —
   geen tokens) staat in `~/.local/state/claude-token-refresh/diagnose/`.
 - `exit 1` van de refresh-unit is normaal: het script gebruikt die code ook
-  voor "gepauzeerd" en "login-nodig". Vandaar `SuccessExitStatus=0 1`.
+  voor "wacht" en "login-nodig". Vandaar `SuccessExitStatus=0 1`.
+
+### Een refresh die niet terugkomt (storing 2026-09-14)
+
+Na twee weken foutloos ververste de timer op 14 september om 15:48 en 16:04
+niets: de CLI wachtte vijf seconden, maar het antwoord op de refresh kwam niet
+binnen die tijd terug. De login bleef heel. Het script ging daarna op pauze tot
+een nieuwe login, en zo werd een hapering een storing van dertig uur. Waarom het
+antwoord uitbleef is niet vastgesteld; de verbinding was achteraf gezond.
+
+Sindsdien:
+
+- **Wachten op het token, niet op de klok.** stdin blijft open tot het nieuwe
+  token daadwerkelijk in het credentialsbestand staat, met een maximum van
+  30 s (`--stdin-open`). De OK-regel zegt hoe lang dat duurde:
+  `Token ververst; nu geldig tot … (nieuw token na 1.52 s, CLI 2.61 s)`.
+  Gezond is rond de anderhalve seconde; kruipt dat getal omhoog, dan hapert
+  het endpoint voordat het echt misgaat.
+- **Nooit meer opgeven zolang de login heel is.** Na een mislukte poging wacht
+  het script 15 min, dan 1 uur, 2 uur en daarna elke 4 uur (`--wachtschema`).
+  In de log: `Wacht: … Volgende poging om …`. Het stopt pas bij
+  `Nodig: claude auth login`. De oude klep (twee pogingen, dan pauze) was
+  bedoeld tegen de race van augustus, waarin een stille rotatie de volgende
+  poging de login liet wissen — maar als de login na een poging nog heel is,
+  heeft die poging niets geroteerd, en is doorproberen niet riskanter.
+- **Markers die zeggen wat ze bewijzen.** De foutregel meldt nu
+  `claude.ai-connectors opgehaald: ja/nee` en `bootstrap geslaagd: ja/nee`.
+  Twee keer "nee" betekent: de CLI kwam niet voorbij de tokenstap. De oude
+  markers ("achtergrondrefresh gestart", "OAuth-antwoord gezien") keken naar
+  de Passes-cache en naar het versturen van een verzoek, en logden daardoor
+  "ja" terwijl er niets was teruggekomen.
+- **De server merkt een nieuwe login zelf op.** Verandert het
+  credentialsbestand terwijl er geen live cijfers zijn, dan vervalt een
+  lopende 429-wachttijd en haalt de server één keer opnieuw op — nooit binnen
+  3 minuten na de vorige poging. Na `claude auth login` is een herstart dus
+  niet meer nodig. In de journal: `credentialsbestand gewijzigd; wachttijd
+  vervalt, nu opnieuw ophalen`.

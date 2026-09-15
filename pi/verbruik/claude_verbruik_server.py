@@ -42,6 +42,17 @@ ruim vers genoeg), en bij een 429 wachten we — zo lang als de server zelf
 in `Retry-After` aangeeft, en anders oplopend van 5 minuten tot maximaal
 een uur. Na een geslaagde poging valt alles terug op het normale ritme.
 
+### Een nieuwe login oppikken
+
+Op 2026-09-15 werkte een verse `claude auth login` niet meteen: de server zat
+net in een 429-wachttijd van een uur en keek al die tijd niet naar het
+credentialsbestand, dus was er alsnog een herstart nodig. Nu houdt de server
+dat bestand in de gaten. Verandert het terwijl er geen live cijfers zijn, dan
+vervalt de wachttijd en haalt hij één keer opnieuw op — maar nooit binnen
+MIN_NA_WIJZIGING_S na de vorige poging, zodat ook een reeks schrijfacties het
+rate-limit-venster van ~3 minuten niet raakt. Is er wél live data (de gewone
+refresh elke acht uur), dan verandert er niets: geen extra API-call.
+
 ### Terugval
 
 Anders dan de laptop-widget is er hier GEEN tweede bron: de lokale cache
@@ -100,6 +111,11 @@ HTTP_TIMEOUT_S = 10
 BACKOFF_START_S = 300
 BACKOFF_MAX_S = 3600
 
+# Minimale tijd tussen de vorige poging en een extra poging omdat het
+# credentialsbestand veranderde. Ruim boven het rate-limit-venster van ~3 min
+# dat op 2026-08-03 gemeten is.
+MIN_NA_WIJZIGING_S = 180
+
 _CRED_PAD = os.path.expanduser("~/.claude/.credentials.json")
 
 
@@ -134,6 +150,19 @@ def _lees_token(pad):
     if not token:
         return None, expires, "geen accessToken (log in met: claude auth login)"
     return token, expires, None
+
+
+def _bestandsvingerafdruk(pad):
+    """(mtime_ns, grootte) van het credentialsbestand, of None.
+
+    Leest de inhoud bewust niet: we willen alleen weten óf het veranderde, en
+    dat kan zo zonder het token nog een keer in het geheugen te halen.
+    """
+    try:
+        st = os.stat(pad)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 # ---- API ------------------------------------------------------------
@@ -282,9 +311,14 @@ class Verbruik:
     tonen in plaats van leeg te vallen.
     """
 
-    def __init__(self, cred_pad=_CRED_PAD, cache_s=CACHE_S):
+    def __init__(self, cred_pad=_CRED_PAD, cache_s=CACHE_S,
+                 min_na_wijziging_s=MIN_NA_WIJZIGING_S):
         self.cred_pad = cred_pad
         self.cache_s = cache_s
+        self.min_na_wijziging_s = min_na_wijziging_s
+        # Hoe het credentialsbestand eruitzag bij de laatste poging; een
+        # afwijking betekent een refresh of een nieuwe login.
+        self._cred_sig = _bestandsvingerafdruk(cred_pad)
         self._slot = threading.Lock()
         self._stand = None       # laatste gelukte meting
         self._stand_ts = 0.0     # wanneer die gemeten is
@@ -302,12 +336,38 @@ class Verbruik:
     def stand(self):
         with self._slot:
             nu = time.time()
+            self._let_op_nieuwe_login(nu)
             # Twee remmen: het normale cache-interval, en een eventuele
             # backoff-pauze na een rate limit. Die tweede overrulet de eerste.
             if nu - self._laatste_poging >= self.cache_s and nu >= self._pauze_tot:
                 self._laatste_poging = nu
                 self._verzamel()
             return self._payload()
+
+    def _let_op_nieuwe_login(self, nu):
+        """Heft de wachttijd op als het credentialsbestand veranderde.
+
+        Alleen als er geen live cijfers zijn — dan is een gewijzigd bestand
+        vrijwel altijd een nieuwe login of een geslaagde refresh die we willen
+        benutten. Met live cijfers is het de gewone refresh van elke acht uur,
+        en die rechtvaardigt geen extra API-call.
+
+        Nooit binnen ``min_na_wijziging_s`` na de vorige poging: dan blijft de
+        wijziging gewoon staan en pakken we hem een volgende keer op.
+        """
+        sig = _bestandsvingerafdruk(self.cred_pad)
+        if sig == self._cred_sig:
+            return
+        if self._bron == "live":
+            self._cred_sig = sig
+            return
+        if nu - self._laatste_poging < self.min_na_wijziging_s:
+            return
+        self._cred_sig = sig
+        self._reset_backoff()
+        self._laatste_poging = 0.0   # cache-rem eraf, zodat stand() nu ophaalt
+        self._meld("credentialsbestand gewijzigd; wachttijd vervalt, nu opnieuw ophalen",
+                   "cred-gewijzigd:{}".format(sig))
 
     def _meld(self, tekst, sleutel):
         """Log alleen wanneer de toestand verandert.
@@ -338,6 +398,9 @@ class Verbruik:
         self._pauze_tot = 0.0
 
     def _verzamel(self):
+        # Vastleggen welke versie van het bestand deze poging gebruikt, zodat
+        # _let_op_nieuwe_login() niet nog eens reageert op dezelfde wijziging.
+        self._cred_sig = _bestandsvingerafdruk(self.cred_pad)
         token, _expires, fout = _lees_token(self.cred_pad)
         if token is None:
             self._meld("token niet bruikbaar: {}".format(fout), "geen-token")

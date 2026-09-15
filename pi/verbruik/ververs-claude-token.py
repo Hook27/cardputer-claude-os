@@ -32,8 +32,10 @@ Toen weigerde de server het refresh-token, bleef het script het elk
 kwartier opnieuw proberen, en maakte de CLI uiteindelijk de login leeg.
 Daarom:
 
-  - hoogstens MAX_POGINGEN pogingen per expiry-venster; daarna pauzeert
-    het script tot er een nieuw token of een nieuwe login is;
+  - na een mislukte poging wacht het script volgens WACHTSCHEMA_MIN
+    (15 min, 1 u, 2 u, daarna elke 4 u) voor het opnieuw probeert. Tot
+    2026-09-15 stopte het na twee pogingen helemaal; zie "Storing 2026-09-14"
+    voor waarom dat verkeerd uitpakte;
   - elke poging schrijft een CLI-debuglog (laatste 5 blijven bewaard);
   - vóór en ná elke poging gaat er een momentopname naar
     momentopnames.jsonl met tijden en VINGERAFDRUKKEN van de tokens —
@@ -68,6 +70,38 @@ bestand tóch ongemoeid laat krijgt nog steeds de eigen uitkomst `onveranderd`,
 en de looptijd wordt nu ook bij een geslaagde refresh gelogd — dat
 vergelijkingspunt ontbrak, waardoor de eerste meting stuurloos was.
 
+### Storing 2026-09-14: een refresh die niet terugkwam
+
+Twee weken lang ververste de timer elke acht uur in één poging. Om 15:48 en
+16:04 ging het mis: de CLI leefde de volle vijf seconden, maar schreef niets
+weg. De login bleef heel — de eerste poging had het token dus níét stilletjes
+geroteerd, anders had de tweede de login gewist. Het debuglog wees aan waar
+het bleef hangen: in de geslaagde run van 07:48 staat
+`[claudeai-mcp] Fetching from ...` één milliseconde na de nieuwe expiry (die
+fetch wacht op de tokenstap), in beide mislukte runs ontbreekt die regel
+volledig. Het antwoord op de refresh kwam niet binnen vijf seconden terug.
+Waaróm niet is niet vastgesteld; de verbinding naar het token-endpoint bleek
+achteraf gezond (0,2 s).
+
+Twee ontwerpkeuzes maakten er een storing van dertig uur van:
+
+  - stdin ging na een vaste vijf seconden dicht. Nu wacht het script tot het
+    credentialsbestand daadwerkelijk verandert, met STDIN_OPEN_S als maximum.
+    Een snelle refresh blijft snel, een trage krijgt ruimte. De tijd tot het
+    nieuwe token op schijf stond gaat mee in de OK-regel, zodat een trager
+    wordend endpoint zichtbaar is voordat het misgaat;
+  - na twee pogingen pauzeerde het script tot een nieuwe login. Die klep was
+    bedoeld tegen de race van augustus, waarin poging 1 stilletjes roteert en
+    poging 2 de login wist. Maar zolang de login heel blijft, bewijst dat dat
+    de vorige poging níets roteerde — en dan is een nieuwe poging niet
+    riskanter dan de vorige. In het ergste geval eindigt doorproberen in
+    handmatig inloggen, net als pauzeren; in het beste geval herstelt het
+    zichzelf. Nu dus een oplopend wachtschema zonder einde.
+
+Daarnaast logden twee markers onwaarheden: "achtergrondrefresh gestart" keek
+naar de Passes-cache in plaats van OAuth, en "OAuth-antwoord gezien" naar het
+versturen van een verzoek in plaats van een antwoord. Zie cli_sporen().
+
 ### Gezondheidscontrole (na de storing van 2026-08-03)
 
 Een vers token is niet hetzelfde als een wérkend token: die dag bleef dit
@@ -92,7 +126,7 @@ Laatste regel op stdout is "RESULTAAT: <code>":
     ververst      refresh gelukt, nieuwe expiry weggeschreven    (exit 0)
     onveranderd   CLI gedraaid maar liet het bestand ongemoeid   (exit 1)
     mislukt       CLI gedraaid, wel iets gewijzigd, geen nieuwe expiry (exit 1)
-    gepauzeerd    pogingenlimiet voor dit venster bereikt        (exit 1)
+    wacht         eerdere poging mislukt, volgende nog niet aan de beurt (exit 1)
     login-nodig   login weg of geweigerd: claude auth login      (exit 1)
     fout          credentialsbestand ontbreekt of is onleesbaar  (exit 1)
 """
@@ -112,7 +146,14 @@ from datetime import datetime
 
 # Standaardwaarden; alle paden zijn met vlaggen te overschrijven voor tests.
 MARGE_MINUTEN = 4      # bewust NET binnen de 5 min die de CLI zelf aanhoudt
-MAX_POGINGEN = 2
+# Minuten tot de volgende poging na 1, 2, 3, ... mislukte pogingen voor
+# hetzelfde token; de laatste waarde blijft daarna gelden. Bewust zonder einde:
+# zolang de login heel is, is doorproberen veilig (zie "Storing 2026-09-14").
+WACHTSCHEMA_MIN = (15, 60, 120, 240)
+# Speling op dat schema. De timer tikt elk kwartier, maar niet op de seconde;
+# zonder speling valt de poging die "na 15 min" mag net te vroeg en schuift
+# hij een heel kwartier op.
+SPELING_S = 90
 TIMEOUT_S = 120
 MAX_LOG_BYTES = 200 * 1024
 WAARSCHUW_DAGEN = 2
@@ -120,9 +161,14 @@ BEWAAR_DEBUG = 5
 # Lokale verbruikserver, om te controleren of het token niet alleen vers maar
 # ook werkzaam is. Leeg maken (of --server "") schakelt die controle uit.
 SERVER_URL = "http://127.0.0.1:8091/verbruik"
-# Seconden dat we stdin openhouden nadat de CLI is gestart. Zie start_cli()
-# voor waarom dat nodig is; ruim genomen, want de kosten zijn nul.
-STDIN_OPEN_S = 5.0
+# MAXIMUM aantal seconden dat stdin openblijft nadat de CLI is gestart. Het
+# script stopt eerder zodra het nieuwe token op schijf staat; zie start_cli().
+# Tot 2026-09-15 was dit een vaste 5 s, en toen de refresh op 2026-09-14 niet
+# binnen die 5 s terugkwam, ging hij verloren.
+STDIN_OPEN_S = 30.0
+# Na de tokenwissel nog even doorlopen: de CLI kan vlak daarna nog andere
+# velden in hetzelfde bestand bijschrijven (profiel, abonnement).
+NAWACHT_S = 1.0
 # Een verbindingsfout mag een tweede kans krijgen: vlak na een herstart is de
 # poort nog niet open, en een loos alarm ondermijnt de bewaking.
 SERVER_POGINGEN = 2
@@ -271,6 +317,22 @@ def vingerafdruk(waarde):
     return hashlib.sha256(waarde.encode("utf-8")).hexdigest()[:12]
 
 
+def token_handtekening(pad):
+    """Wat er in het credentialsbestand staat, zonder de tokens zelf.
+
+    Geeft ``(expiresAt, vingerafdruk access, vingerafdruk refresh)``, of None
+    als het bestand (nog) niet leesbaar is — bijvoorbeeld midden in een
+    schrijfactie van de CLI. Daarmee ziet start_cli() het moment waarop het
+    nieuwe token op schijf staat.
+    """
+    try:
+        o = lees_oauth(pad) or {}
+    except (OSError, ValueError):
+        return None
+    return (o.get("expiresAt"), vingerafdruk(o.get("accessToken")),
+            vingerafdruk(o.get("refreshToken")))
+
+
 def schrijf_momentopname(ctx, oauth, fase, pogingnaam):
     try:
         os.makedirs(ctx.diagnose, exist_ok=True)
@@ -309,21 +371,27 @@ _DEBUG_PATROON = re.compile(
 
 
 def cli_sporen(pad):
-    """Wat het CLI-debuglog zegt over de refreshpoging zelf.
+    """Wat het CLI-debuglog aantoonbaar zegt over de run.
 
-    Geeft ``(duur_s, achtergrond_gestart, oauth_gezien)``.
+    Geeft ``(logspan_s, connectors_opgehaald, bootstrap_geslaagd)``.
 
-    De duur is het verschil tussen de eerste en laatste tijdstempel in het log,
-    oftewel hoe lang het CLI-proces heeft geleefd. Dat is het getal waar het om
-    draait bij het vermoeden van 2026-08-05: de CLI start de refresh op de
-    achtergrond ("refreshing in background") en onze lege prompt geeft hem
-    verder niets te doen, dus hij kan vertrekken vóór die refresh geland is.
-    Bereikte de refresh de server toch, dan is het refresh-token daar geroteerd
-    en dus dood, terwijl het nieuwe nooit is opgeslagen — en dan sloopt de
-    vólgende poging de login.
+    ``logspan_s`` is het verschil tussen de eerste en laatste tijdstempel in het
+    log, oftewel hoe lang de CLI iets te melden had.
 
-    Als stille no-ops samenvallen met een korte looptijd, klopt dat verhaal.
-    Zo niet, dan moeten we een andere kant op kijken.
+    ``connectors_opgehaald``: de regel ``[claudeai-mcp] Fetching from`` staat
+    erin. Die fetch wacht op de tokenstap, dus staat hij er, dan kwam de CLI
+    voorbij die stap — bij een verlopen token betekent dat: de refresh kwam
+    terug. Op 2026-09-14 stond hij in de geslaagde run één milliseconde na de
+    nieuwe expiry, en ontbrak hij in beide mislukte runs volledig.
+
+    ``bootstrap_geslaagd``: de regel ``[Bootstrap] Fetch ok`` staat erin.
+
+    Bewust NIET meer gebruikt, want beide logen op 2026-09-14 "ja" terwijl er
+    niets was teruggekomen:
+      - "refreshing in background" — dat gaat over de Passes-cache, niet over
+        OAuth;
+      - "[Bootstrap] Fetching" als teken van een OAuth-antwoord — dat is het
+        versturen van een verzoek, geen antwoord.
     """
     try:
         with open(pad, "r", encoding="utf-8", errors="replace") as f:
@@ -343,9 +411,9 @@ def cli_sporen(pad):
     duur = (stempels[-1] - stempels[0]).total_seconds() if len(stempels) >= 2 else None
 
     tekst = "".join(regels).lower()
-    achtergrond = "refreshing in background" in tekst
-    oauth_gezien = ("oauth refresh" in tekst) or ("[bootstrap] fetching" in tekst)
-    return duur, achtergrond, oauth_gezien
+    connectors = "[claudeai-mcp] fetching from" in tekst
+    bootstrap_ok = "[bootstrap] fetch ok" in tekst
+    return duur, connectors, bootstrap_ok
 
 
 def debug_hoogtepunten(pad):
@@ -378,14 +446,33 @@ def lees_status(ctx):
         return None
 
 
-def schrijf_status(ctx, venster, pogingen):
+def schrijf_status(ctx, venster, pogingen, volgende_poging=None):
     try:
         os.makedirs(ctx.staat_map, exist_ok=True)
+        data = {"venster": venster, "pogingen": pogingen,
+                "bijgewerkt": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        if volgende_poging is not None:
+            data["volgende_poging"] = int(volgende_poging)
+            # Alleen voor mensen die het bestand openen; het script leest het niet.
+            data["volgende_poging_klok"] = datetime.fromtimestamp(
+                volgende_poging).strftime("%Y-%m-%d %H:%M:%S")
         with open(ctx.status, "w", encoding="utf-8") as f:
-            json.dump({"venster": venster, "pogingen": pogingen,
-                       "bijgewerkt": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}, f)
+            json.dump(data, f)
     except OSError:
         pass
+
+
+def wachttijd_min(schema, pogingen):
+    """Minuten tot de volgende poging na ``pogingen`` mislukkingen (>= 1)."""
+    schema = schema or WACHTSCHEMA_MIN
+    return schema[min(max(pogingen, 1), len(schema)) - 1]
+
+
+def plan_volgende(ctx, venster, pogingen, schema):
+    """Leg een mislukte poging vast; geeft het tijdstip (epoch s) van de volgende."""
+    volgende = time.time() + wachttijd_min(schema, pogingen) * 60
+    schrijf_status(ctx, venster, pogingen, volgende)
+    return volgende
 
 
 # --- CLI --------------------------------------------------------------
@@ -424,7 +511,8 @@ def is_ingelogd(exe, werkmap):
         return None
 
 
-def start_cli(exe, werkmap, debug_pad, timeout_s, stdin_open_s):
+def start_cli(exe, werkmap, debug_pad, timeout_s, stdin_open_s, cred_pad=None,
+              nawacht_s=NAWACHT_S):
     """Start de CLI met een lege prompt, maar sluit stdin niet meteen.
 
     De CLI vuurt zijn OAuth-refresh af als achtergrondtaak en wacht daar niet
@@ -440,23 +528,43 @@ def start_cli(exe, werkmap, debug_pad, timeout_s, stdin_open_s):
     De volgende poging biedt dat dode token aan, krijgt een 400, en de CLI wist
     de login. Dat kostte drie logins in een week.
 
-    Door de pijp een paar seconden open te houden blijft het proces wachten op
-    zijn prompt en krijgt die achtergrondrefresh de tijd om te landen en
-    weggeschreven te worden. Er gaat nog steeds geen prompt naartoe, dus nog
-    steeds geen model-call, geen tokenverbruik en geen nieuw 5-uursvenster.
+    Door de pijp open te houden blijft het proces wachten op zijn prompt en
+    krijgt die achtergrondrefresh de tijd om te landen en weggeschreven te
+    worden. Er gaat nog steeds geen prompt naartoe, dus nog steeds geen
+    model-call, geen tokenverbruik en geen nieuw 5-uursvenster.
 
-    Geeft ``(exitcode, looptijd_s)``. Gooit ``subprocess.TimeoutExpired`` door.
+    Hoe lang is sinds 2026-09-15 geen vaste gok meer. Met ``cred_pad`` houdt
+    deze functie het credentialsbestand in de gaten en sluit stdin zodra het
+    nieuwe token erin staat (plus ``nawacht_s``); ``stdin_open_s`` is alleen
+    nog het maximum. Een vaste vijf seconden bleek op 2026-09-14 te krap: de
+    refresh kwam toen niet binnen die tijd terug en ging verloren.
+
+    Geeft ``(exitcode, looptijd_s, token_na_s)``. ``token_na_s`` is hoe lang het
+    duurde tot het bestand veranderde, of None als dat tijdens het wachten niet
+    gebeurde. Gooit ``subprocess.TimeoutExpired`` door.
     """
     begin = time.monotonic()
+    voor = token_handtekening(cred_pad) if cred_pad else None
+    token_na_s = None
     proc = subprocess.Popen(
         [exe, "-p", "--no-session-persistence", "--debug-file", debug_pad],
         cwd=werkmap, stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         # In stapjes wachten, zodat we niet nodeloos blijven zitten als de CLI
-        # om een andere reden al klaar is.
-        einde = time.monotonic() + stdin_open_s
+        # om een andere reden al klaar is, of als het token al binnen is.
+        einde = begin + stdin_open_s
         while time.monotonic() < einde and proc.poll() is None:
+            if voor is not None:
+                nu = token_handtekening(cred_pad)
+                # None = bestand even onleesbaar (midden in een schrijfactie):
+                # gewoon de volgende ronde opnieuw kijken.
+                if nu is not None and nu != voor:
+                    token_na_s = time.monotonic() - begin
+                    nawacht_einde = time.monotonic() + nawacht_s
+                    while time.monotonic() < nawacht_einde and proc.poll() is None:
+                        time.sleep(0.1)
+                    break
             time.sleep(0.1)
         # Stdin niet zelf sluiten: communicate() doet dat, en op Linux flust
         # het eerst -- op een al gesloten pijp geeft dat
@@ -471,7 +579,7 @@ def start_cli(exe, werkmap, debug_pad, timeout_s, stdin_open_s):
         except Exception:
             pass
         raise
-    return proc.returncode, time.monotonic() - begin
+    return proc.returncode, time.monotonic() - begin, token_na_s
 
 
 def duur(minuten):
@@ -493,7 +601,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--marge", type=int, default=MARGE_MINUTEN,
                    help="ververs zodra het token nog minder dan dit aantal minuten geldig is")
-    p.add_argument("--max-pogingen", type=int, default=MAX_POGINGEN)
+    p.add_argument("--wachtschema",
+                   default=",".join(str(m) for m in WACHTSCHEMA_MIN),
+                   help="minuten tot de volgende poging na 1, 2, 3, ... mislukte "
+                        "pogingen, komma-gescheiden; de laatste waarde blijft gelden")
     p.add_argument("--dry-run", action="store_true",
                    help="bepaal wel de actie, start de CLI niet")
     p.add_argument("--credentials", default=_CRED_PAD)
@@ -501,8 +612,8 @@ def main():
     p.add_argument("--claude", default=None, help="pad naar de claude-binary")
     p.add_argument("--timeout", type=int, default=TIMEOUT_S)
     p.add_argument("--stdin-open", type=float, default=STDIN_OPEN_S,
-                   help="seconden dat stdin openblijft, zodat de CLI niet "
-                        "vertrekt voor zijn achtergrondrefresh geland is")
+                   help="MAXIMUM aantal seconden dat stdin openblijft; het script "
+                        "stopt eerder zodra het nieuwe token op schijf staat")
     p.add_argument("--server", default=SERVER_URL,
                    help="verbruikserver om de gezondheid bij op te vragen; "
                         "leeg laten schakelt die controle uit")
@@ -511,6 +622,12 @@ def main():
     p.add_argument("--server-pauze", type=float, default=SERVER_PAUZE_S,
                    help="seconden tussen die pogingen")
     args = p.parse_args()
+
+    try:
+        schema = [max(0, int(x)) for x in args.wachtschema.split(",") if x.strip()]
+    except ValueError:
+        schema = []
+    schema = schema or list(WACHTSCHEMA_MIN)
 
     ctx = Ctx(args.credentials, args.staat_map, args.claude)
 
@@ -570,22 +687,29 @@ def main():
                     "claude auth login".format(klok(rt_ms)))
         stop_met("login-nodig", 1)
 
-    # --- 4. Pogingenlimiet voor dit expiry-venster --------------------
+    # --- 4. Wachtschema na eerdere mislukkingen voor dit token --------
+    # Een ander token (andere expiresAt) begint met een schone lei: een
+    # geslaagde refresh of een handmatige login zet de teller zo vanzelf op
+    # nul. Een statusbestand van vóór 2026-09-15 heeft geen volgende_poging;
+    # dat telt als "mag nu", zodat een oude permanente pauze meteen vervalt.
     status = lees_status(ctx)
     al_geprobeerd = 0
+    volgende = 0.0
     if status and int(status.get("venster", -1)) == expires_at:
         al_geprobeerd = int(status.get("pogingen", 0))
+        volgende = float(status.get("volgende_poging") or 0)
 
-    if al_geprobeerd >= args.max_pogingen:
-        if heartbeat_nodig(ctx):
-            schrijf_log(ctx, "OK", "Gepauzeerd: {} pogingen voor dit token gedaan, "
-                        "geen daarvan hielp. Wacht op een nieuw token of een nieuwe "
-                        "login. Diagnose: {}".format(al_geprobeerd, ctx.diagnose))
-        stop_met("gepauzeerd", 1)
+    if al_geprobeerd > 0 and time.time() < volgende - SPELING_S:
+        if heartbeat_nodig(ctx, "INFO"):
+            schrijf_log(ctx, "INFO", "Wacht: {} poging(en) voor dit token hielpen "
+                        "niet, maar de login staat nog. Volgende poging om {}. "
+                        "Diagnose: {}".format(al_geprobeerd,
+                                              klok(int(volgende * 1000)), ctx.diagnose))
+        stop_met("wacht", 1)
 
     poging = al_geprobeerd + 1
-    schrijf_log(ctx, "INFO", "Token {} -- refreshpoging {}/{} via Claude Code CLI.".format(
-        duur(resterend_min), poging, args.max_pogingen))
+    schrijf_log(ctx, "INFO", "Token {} -- refreshpoging {} via Claude Code CLI.".format(
+        duur(resterend_min), poging))
 
     if args.dry_run:
         schrijf_log(ctx, "INFO", "dry-run: CLI niet gestart.")
@@ -608,12 +732,14 @@ def main():
     schrijf_momentopname(ctx, oauth, "voor", pogingnaam)
 
     try:
-        exitcode, cli_looptijd = start_cli(
-            exe, ctx.werkmap, debug_pad, args.timeout, args.stdin_open)
+        exitcode, cli_looptijd, token_na_s = start_cli(
+            exe, ctx.werkmap, debug_pad, args.timeout, args.stdin_open,
+            cred_pad=ctx.cred)
     except subprocess.TimeoutExpired:
+        volgende = plan_volgende(ctx, expires_at, poging, schema)
         schrijf_log(ctx, "FOUT", "CLI reageerde niet binnen {} s en is "
-                    "afgebroken.".format(args.timeout))
-        schrijf_status(ctx, expires_at, poging)
+                    "afgebroken. Volgende poging om {}.".format(
+                        args.timeout, klok(int(volgende * 1000))))
         stop_met("mislukt", 1)
     except OSError as e:
         schrijf_log(ctx, "FOUT", "Kan claude niet starten: {}".format(e))
@@ -636,9 +762,17 @@ def main():
     if na and na.get("expiresAt") and int(na["expiresAt"]) > expires_at:
         # Looptijd meeloggen, ook bij succes: zonder dat vergelijkingspunt zegt
         # het getal bij een mislukking niets. Dat gat zat in de meting van
-        # 2026-08-05 en maakte die stuurloos.
-        schrijf_log(ctx, "OK", "Token ververst; nu geldig tot {} (CLI {:.2f} s).".format(
-            klok(int(na["expiresAt"])), cli_looptijd))
+        # 2026-08-05 en maakte die stuurloos. Sinds 2026-09-15 ook hoe lang het
+        # duurde tot het nieuwe token op schijf stond: gezond is ~1,5 s. Kruipt
+        # dat richting STDIN_OPEN_S, dan hapert het endpoint.
+        if token_na_s is not None:
+            tijden = "nieuw token na {:.2f} s, CLI {:.2f} s".format(
+                token_na_s, cli_looptijd)
+        else:
+            tijden = "CLI {:.2f} s; tokenwissel pas na het wachten gezien".format(
+                cli_looptijd)
+        schrijf_log(ctx, "OK", "Token ververst; nu geldig tot {} ({}).".format(
+            klok(int(na["expiresAt"])), tijden))
         schrijf_status(ctx, int(na["expiresAt"]), 0)
         stop_met("ververst", 0)
 
@@ -652,17 +786,17 @@ def main():
             stop_met("geldig", 0)
 
     # --- 7. Uitzoeken WAAROM het niet lukte ---------------------------
-    schrijf_status(ctx, expires_at, poging)
+    volgende = plan_volgende(ctx, expires_at, poging, schema)
+    volgende_klok = klok(int(volgende * 1000))
 
     for regel in debug_hoogtepunten(debug_pad):
         schrijf_log(ctx, "DEBUG", regel)
 
-    # Bleef het bestand volledig ongemoeid, dan is dat een eigen verhaal en
-    # geen gewone mislukking: de CLI heeft dan niets weggeschreven, maar kan de
-    # server wél bereikt hebben. Zie cli_sporen() voor waarom dat gevaarlijk
-    # is. Bewust nog GEEN ander gedrag — eerst meten hoe vaak dit gebeurt en
-    # of het samenvalt met een korte looptijd, anders weten we straks niet
-    # welke ingreep hielp.
+    # Bleef het bestand volledig ongemoeid, dan heeft de CLI niets
+    # weggeschreven. Omdat de login daarbij heel bleef, heeft een eventuele
+    # vorige poging het token niet stilletjes geroteerd (anders had déze
+    # poging de login gewist) -- opnieuw proberen is dus niet riskanter dan
+    # wat we net deden. Zie de docstring, "Storing 2026-09-14".
     if (na is not None
             and na.get("expiresAt") == oauth.get("expiresAt")
             and na.get("accessToken") == oauth.get("accessToken")
@@ -670,18 +804,20 @@ def main():
         # NB: niet 'duur' als naam gebruiken -- dat is de functie hierboven, en
         # een gelijknamige lokale variabele maakt die onbereikbaar in de hele
         # functie (Python bepaalt dat bij het compileren, niet bij het uitvoeren).
-        logspan, achtergrond, oauth_gezien = cli_sporen(debug_pad)
+        logspan, connectors, bootstrap_ok = cli_sporen(debug_pad)
+        hint = (" -- de CLI kwam niet voorbij de tokenstap"
+                if not connectors and not bootstrap_ok else "")
         schrijf_log(ctx, "FOUT", (
-            "Poging {}/{}: de CLI draaide maar veranderde niets -- expiry en "
-            "beide tokens identiek. Proces leefde {:.2f} s, logde {}; "
-            "achtergrondrefresh gestart: {}; OAuth-antwoord gezien: {}. "
-            "Bereikte die refresh de server wel, dan is het token nu dood en "
-            "sloopt de volgende poging de login. Debuglog: {}").format(
-                poging, args.max_pogingen, cli_looptijd,
+            "Poging {}: de CLI draaide maar veranderde niets -- expiry en beide "
+            "tokens identiek. CLI liep {:.1f} s (stdin maximaal {:.0f} s open), "
+            "log beslaat {}; claude.ai-connectors opgehaald: {}; bootstrap "
+            "geslaagd: {}{}. Login staat nog; volgende poging om {}. "
+            "Debuglog: {}").format(
+                poging, cli_looptijd, args.stdin_open,
                 "{:.2f} s".format(logspan) if logspan is not None else "onbekend",
-                "ja" if achtergrond else "nee",
-                "ja" if oauth_gezien else "nee",
-                debug_pad))
+                "ja" if connectors else "nee",
+                "ja" if bootstrap_ok else "nee",
+                hint, volgende_klok, debug_pad))
         stop_met("onveranderd", 1)
 
     if na and (not na.get("refreshToken") or not na.get("accessToken")):
@@ -696,9 +832,9 @@ def main():
         stop_met("login-nodig", 1)
 
     auth_tekst = "auth-status onbekend" if ingelogd is None else "login staat nog"
-    schrijf_log(ctx, "FOUT", "Poging {}/{} mislukt: expiry niet opgeschoven "
-                "({}, CLI exit {}). Debuglog: {}".format(
-                    poging, args.max_pogingen, auth_tekst, exitcode, debug_pad))
+    schrijf_log(ctx, "FOUT", "Poging {} mislukt: expiry niet opgeschoven "
+                "({}, CLI exit {}). Volgende poging om {}. Debuglog: {}".format(
+                    poging, auth_tekst, exitcode, volgende_klok, debug_pad))
     stop_met("mislukt", 1)
 
 
