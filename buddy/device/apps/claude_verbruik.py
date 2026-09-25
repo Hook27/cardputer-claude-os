@@ -86,11 +86,12 @@ _POLL_MS = 45000   # netwerk-poll
 _KLOK_MS = 1000    # aftelklok bijwerken
 _TICK_MS = 40      # toetsenbord
 
-# Kleurdrempels voor de balken. Onder 60% groen, tot 85% geel, daarboven
-# rood — gelijk aan de kleuren van de laptop-widget zodat beide schermen
-# hetzelfde "hoe sta ik ervoor" signaal geven.
-_DREMPEL_GEEL = 60.0
-_DREMPEL_ROOD = 85.0
+# Kleurdrempels voor de balken. Onder 70% groen, tot 90% geel, daarboven
+# rood — gelijk aan DrempelLet/DrempelAlarm van de laptop-widget en aan het
+# Nest Hub-scherm, zodat alle schermen hetzelfde "hoe sta ik ervoor" signaal
+# geven. Tot 2026-09-25 stond hier 60/85, terwijl de widget al op 70/90 zat.
+_DREMPEL_GEEL = 70.0
+_DREMPEL_ROOD = 90.0
 
 # Verticale posities. Kop 0..20, hintstrip vanaf _H-18 (=117); alles
 # daartussen is van ons.

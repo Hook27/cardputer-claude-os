@@ -130,7 +130,10 @@
     return s > 0 ? "<1m" : "nu";
   }
 
-  function niveau(p) { return p >= 95 ? "crit" : p >= 80 ? "warn" : "ok"; }
+  // Zelfde drempels als de laptop-widget (DrempelLet 70, DrempelAlarm 90) en
+  // de Cardputer, zodat alle schermen tegelijk verkleuren. Tot 2026-09-25
+  // stond hier 80/95.
+  function niveau(p) { return p >= 90 ? "crit" : p >= 70 ? "warn" : "ok"; }
 
   function zetMeter(id, pct, resetS) {
     var m = $(id);
