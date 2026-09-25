@@ -38,6 +38,21 @@ python3 scripts/repl_run.py --port /dev/cu.usbmodem1101 --script "import os; pri
 
 `gen_burst_frames.py` regenerates `burst_frames.py` from source sprites.
 
+## Verkenner (file explorer)
+
+`verkenner/` holds a file explorer for SD cards (exFAT and FAT) and the
+internal flash: photos, text/hex, and a forensic info page. It is too big to
+compile on the device, so it ships as precompiled `.mpy` with its own push
+script and is deliberately **not** under `device/` (where `install_apps.py`
+would push the `.py` sources, which take precedence over `.mpy`):
+
+```bash
+python -m pip install --user mpy-cross==1.27.0.post2
+python scripts/push_verkenner.py --port COM5
+```
+
+Details (in Dutch) in [`verkenner/LEESMIJ.md`](verkenner/LEESMIJ.md).
+
 ## References
 
 - `references/` — BLE protocol notes for the Claude Buddy app

@@ -17,6 +17,10 @@ Big pieces:
 - `buddy/device/` — MicroPython launcher (`main.py`) + the apps that run on
   the Cardputer. Shared peer modules (`buddy_ble`, `buddy_protocol`,
   `buddy_state`, `buddy_chars`, `buddy_ui_cp`) live alongside.
+- `buddy/verkenner/` — the file explorer (SD exFAT/FAT + flash, photos,
+  text/hex, forensic info page). Kept **outside** `buddy/device/` on
+  purpose and installed as precompiled `.mpy`; see
+  [`buddy/verkenner/LEESMIJ.md`](buddy/verkenner/LEESMIJ.md).
 - `mcp/` — host-side `bleak` BLE bridge exposing `notify`/`ask`/`confirm`
   to any MCP client.
 - `worker/` — Cloudflare Worker (voice STT + chat memory; Pager backend).
@@ -47,6 +51,11 @@ Big pieces:
   `webkey-experiment-status` before trusting any external summary of it
   (an inaccurate browser-Claude summary circulates).
 - **pi_dashboard**, **snake**, **particle_life** — launcher extras.
+- **verkenner** — file explorer; source in `buddy/verkenner/`, on the device
+  as `/flash/apps/verkenner.mpy` + `/flash/verkenner_*.mpy`. Reads exFAT
+  cards with its own raw-sector reader (the firmware can't mount exFAT) and
+  turns WiFi off while it runs. Memory note `verkenner-app-status` has the
+  state and what still needs the owner's eyes on the screen.
 
 `buddy/device/apps - backup/` is an old snapshot; the live apps are in
 `apps/`. Some apps from the README (push_to_claude, pager, cardputer_mcp)
@@ -69,6 +78,14 @@ live in the backup dir / are pushed separately — confirm what's actually in
 - A file in `/flash/apps/` (e.g. `claude_buddy.py`) imports peer modules
   from `/flash/` (e.g. `buddy_protocol.py`) — if you change an app *and* a
   peer module, push **both**, or the app crashes on a missing symbol.
+- **Big apps ship as `.mpy`** because compiling a large `.py` on the device
+  runs out of RAM (MemoryError measured at 46 KB free for an 18 KB module).
+  `install_apps.py` only handles `.py`, and a `.py` beats a `.mpy` of the
+  same name on import. So those apps live outside `buddy/device/` and have
+  their own push script: `python buddy/scripts/push_verkenner.py --port COM5`
+  (needs `pip install --user mpy-cross==1.27.0.post2`, i.e. mpy v6.3 =
+  MicroPython 1.27; compiled with `-march=xtensawin` for the viper code),
+  and `buddy/scripts/push_pager_mpy.py` for the pager.
 - Device app conventions: `import M5` (never `from M5 import *`), DejaVu9
   font, 24-bit RGB palette, direct LCD drawing (no canvas/blit), and the
   `try: run() finally: sys.modules.pop(__name__)` clean return-to-launcher.
