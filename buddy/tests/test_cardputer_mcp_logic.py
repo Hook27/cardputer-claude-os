@@ -20,7 +20,14 @@ import sys
 import types
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_APP = os.path.join(_HERE, "..", "device", "apps", "cardputer_mcp.py")
+# Upstream ships the app in apps/; this fork keeps it in "apps - backup" so the
+# launcher bundle leaves it out (install_apps.py ignores that dir). Test
+# whichever copy exists, preferring apps/ since that's what gets installed.
+_APP_CANDIDATES = [
+    os.path.join(_HERE, "..", "device", d, "cardputer_mcp.py")
+    for d in ("apps", "apps - backup")
+]
+_APP = next((p for p in _APP_CANDIDATES if os.path.exists(p)), _APP_CANDIDATES[-1])
 
 
 def _install_fakes():
