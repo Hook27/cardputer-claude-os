@@ -8,10 +8,14 @@ rates, and different MCP-client expectations.
 
 ## Status
 
-Implemented through iter 5. `notify`, `ask`, and `confirm` work
-end-to-end over BLE (device `cardputer_mcp.py` ↔ host `mcp/server.py`).
-The host now speaks MCP over **two transports** to the same `Bridge`
-and the same device:
+Implemented through iter 5, plus the iter-4 `show` line, a verified-approval
+`details` field on `confirm` (firmware `0.4.0`), device→host `heartbeat`
+telemetry powering the host-side `device_status` tool (firmware `0.4.1`), and
+an ambient `progress` bar that shares the `show` channel ring (firmware
+`0.4.2`).
+`notify`, `ask`, `confirm`, `show`, and `progress` work end-to-end over BLE (device
+`cardputer_mcp.py` ↔ host `mcp/server.py`). The host now speaks MCP over
+**two transports** to the same `Bridge` and the same device:
 
 - **stdio** — the original local path (`claude mcp add cardputer …`).
 - **streamable-http** — `CARDPUTER_HTTP=1`, a long-lived daemon on
@@ -65,14 +69,15 @@ All commands carry an `id` string the host generated; the device
 echoes that `id` on every ack so the host can match replies to
 in-flight requests.
 
-| cmd       | shape                                                                                           | behavior                                                                                                                       |
-| --------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | ---------------------- | ------------------------------------------------------------ |
-| `notify`  | `{"cmd":"notify","id":"...","title":"...","body":"...","urgency":"info"                         | "warn"                                                                                                                         | "crit","agent":"..."}` | Display the notification, beep per urgency, ack immediately. |
-| `ask`     | `{"cmd":"ask","id":"...","question":"...","choices":["a","b",...],"timeout_s":N,"agent":"..."}` | Show question + choices, wait for keypress or timeout. Send a `pending` ack on receipt and a resolution ack later (see below). |
-| `confirm` | `{"cmd":"confirm","id":"...","title":"...","danger":true,"timeout_s":N,"agent":"..."}`          | Show a danger banner, require hold-Y-for-3 s. Send `pending` ack on receipt + resolution ack later.                            |
-| `show`    | `{"cmd":"show","id":"...","text":"...","channel":"agent-tag"}`                                  | Update one line of the ambient status area. Ack immediately. _(iter 4)_                                                        |
-| `cancel`  | `{"cmd":"cancel","id":"...","target_id":"..."}`                                                 | Cancel a pending `ask` / `confirm`. Ack with cancellation state.                                                               |
-| `ping`    | `{"cmd":"ping","id":"..."}`                                                                     | Round-trip liveness check.                                                                                                     |
+| cmd        | shape                                                                                                  | behavior                                                                                                                                                                                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ------------------------------------------------------------ |
+| `notify`   | `{"cmd":"notify","id":"...","title":"...","body":"...","urgency":"info"                                | "warn"                                                                                                                                                                                                                                                         | "crit","agent":"..."}` | Display the notification, beep per urgency, ack immediately. |
+| `ask`      | `{"cmd":"ask","id":"...","question":"...","choices":["a","b",...],"timeout_s":N,"agent":"..."}`        | Show question + choices, wait for keypress or timeout. Send a `pending` ack on receipt and a resolution ack later (see below).                                                                                                                                 |
+| `confirm`  | `{"cmd":"confirm","id":"...","title":"...","danger":true,"timeout_s":N,"details":"...","agent":"..."}` | Show a danger banner, require hold-Y-for-3 s. Send `pending` ack on receipt + resolution ack later. `details` (optional, cap `confirm_details`, ≤~256 chars so the whole line fits the 512-byte RX buffer) renders a scrollable action diff above the gesture. |
+| `show`     | `{"cmd":"show","id":"...","text":"...","channel":"agent-tag"}`                                         | Update one ambient status line (per `channel`, newest-first, capped) on the idle screen. Silent; ignores DND. Ack immediately. _(cap `show`)_                                                                                                                  |
+| `progress` | `{"cmd":"progress","id":"...","label":"...","percent":0..100,"channel":"agent-tag"}`                   | Update one ambient channel as a filling 0–100% bar (per `channel`, shares the `show` ring — latest write wins). `percent` is clamped to 0..100. Silent; ignores DND. Ack immediately. _(cap `progress`)_                                                       |
+| `cancel`   | `{"cmd":"cancel","id":"...","target_id":"..."}`                                                        | Cancel a pending `ask` / `confirm`. Ack with cancellation state.                                                                                                                                                                                               |
+| `ping`     | `{"cmd":"ping","id":"..."}`                                                                            | Round-trip liveness check.                                                                                                                                                                                                                                     |
 
 The `agent` field carries a short tag (`"claude-code"`, `"managed-agent"`,
 `"local"`, etc.). Over the HTTP transport it's set from the caller's
@@ -81,35 +86,37 @@ so it can't be forged. The device:
 
 - **renders it on the `ask` / `confirm` banner** (`from:<agent>`) so the
   user sees who is asking before answering or holding Y — _implemented_
+- **keys the host-side notify rate limit** (~1 non-`crit` notify per 60 s
+  per agent; `crit` and the blocking tools bypass) — _implemented in
+  `mcp/server.py` via `ratelimit.py`; device-side capping remains future
+  defense-in-depth_
 - could attribute notifications in a history view — _future_
-- could apply a per-agent rate limit (~1 notify per 60 s; `crit` and
-  blocking tools bypass) — _future; restraint is self-imposed today_
 
 ## Outbound (device → host)
 
-| shape                                                                                | when                                                                                                                                                |
-| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `{"event":"hello","version":"0.2.0","name":"...","caps":["notify","ask","confirm"]}` | Once, ~1.5 s after the BLE central subscribes to TX (delay is to let the central settle its CCCD write). `caps` lists tools this firmware supports. |
-| `{"event":"heartbeat","bat":{...},"rssi":...}`                                       | Every ~10 s while connected, mirroring Buddy's cadence.                                                                                             |
-| `{"ack":"<cmd>","id":"...","ok":true}`                                               | Generic success ack — for `notify`, `show`, `ping`, `cancel`.                                                                                       |
-| `{"ack":"<cmd>","id":"...","ok":false,"err":"..."}`                                  | Generic failure ack. `err` is a short stable string.                                                                                                |
-| `{"ack":"ask","id":"...","pending":true}`                                            | Immediate ack for `ask` / `confirm` indicating the device received the request and is awaiting user input.                                          |
-| `{"ack":"ask","id":"...","ok":true,"choice":"..."}`                                  | Resolution: user picked a choice.                                                                                                                   |
-| `{"ack":"ask","id":"...","ok":false,"timed_out":true}`                               | Resolution: `timeout_s` elapsed.                                                                                                                    |
-| `{"ack":"ask","id":"...","ok":false,"dnd":true}`                                     | Resolution: device was in do-not-disturb mode.                                                                                                      |
-| `{"ack":"ask","id":"...","ok":false,"cancelled":true}`                               | Resolution: host sent `cancel` for this id, or user pressed ESC.                                                                                    |
-| `{"ack":"confirm","id":"...","ok":true,"confirmed":true,"hold_ms":N}`                | Resolution: user held Y for ≥ 3 s. `hold_ms` is the measured hold duration.                                                                         |
-| `{"ack":"confirm","id":"...","ok":false,"cancelled":true}`                           | Resolution: user pressed N or ESC.                                                                                                                  |
-| `{"ack":"confirm","id":"...","ok":false,"timed_out":true}`                           | Resolution: `timeout_s` elapsed before the user could complete the hold.                                                                            |
+| shape                                                                                                                    | when                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{"event":"hello","version":"0.4.2","name":"...","caps":["notify","ask","confirm","confirm_details","show","progress"]}` | Once, ~1.5 s after the BLE central subscribes to TX (delay is to let the central settle its CCCD write). `caps` lists tools/features this firmware supports.                                                  |
+| `{"event":"heartbeat","dnd":bool,"uptime":N,"bat":{...}}`                                                                | Every ~10 s while connected (fw 0.4.1+). Cached by the host for the read-only `device_status` tool. `bat` is best-effort (omitted on builds without a usable Power API); `rssi` is not sent by this firmware. |
+| `{"ack":"<cmd>","id":"...","ok":true}`                                                                                   | Generic success ack — for `notify`, `show`, `progress`, `ping`, `cancel`.                                                                                                                                     |
+| `{"ack":"<cmd>","id":"...","ok":false,"err":"..."}`                                                                      | Generic failure ack. `err` is a short stable string.                                                                                                                                                          |
+| `{"ack":"ask","id":"...","pending":true}`                                                                                | Immediate ack for `ask` / `confirm` indicating the device received the request and is awaiting user input.                                                                                                    |
+| `{"ack":"ask","id":"...","ok":true,"choice":"..."}`                                                                      | Resolution: user picked a choice.                                                                                                                                                                             |
+| `{"ack":"ask","id":"...","ok":false,"timed_out":true}`                                                                   | Resolution: `timeout_s` elapsed.                                                                                                                                                                              |
+| `{"ack":"ask","id":"...","ok":false,"dnd":true}`                                                                         | Resolution: device was in do-not-disturb mode.                                                                                                                                                                |
+| `{"ack":"ask","id":"...","ok":false,"cancelled":true}`                                                                   | Resolution: host sent `cancel` for this id, or user pressed ESC.                                                                                                                                              |
+| `{"ack":"confirm","id":"...","ok":true,"confirmed":true,"hold_ms":N}`                                                    | Resolution: user held Y for ≥ 3 s. `hold_ms` is the measured hold duration.                                                                                                                                   |
+| `{"ack":"confirm","id":"...","ok":false,"cancelled":true}`                                                               | Resolution: user pressed N or ESC.                                                                                                                                                                            |
+| `{"ack":"confirm","id":"...","ok":false,"timed_out":true}`                                                               | Resolution: `timeout_s` elapsed before the user could complete the hold.                                                                                                                                      |
 
 ### hello event body
 
 ```
 {
   "event": "hello",
-  "version": "0.1.0",      # firmware version of cardputer_mcp.py
+  "version": "0.4.2",      # firmware version of cardputer_mcp.py
   "name":    "Pip",        # device-set display name (default: "Cardputer")
-  "caps":    ["notify", "ask"],   # tool surface this build implements
+  "caps":    ["notify", "ask", "confirm", "confirm_details", "show", "progress"],  # tool/feature surface this build implements
   "model":   "cardputer-adv",     # or "cardputer" for non-Adv
   "mtu":     20            # current ATT MTU; host should chunk smaller writes accordingly
 }
@@ -117,16 +124,17 @@ so it can't be forged. The device:
 
 ### heartbeat body
 
-Mirrors the Buddy heartbeat status payload so device-side state code
-can be shared between apps:
+Sent every ~10 s while connected (fw 0.4.1+); the host caches the latest one
+for the `device_status` tool. `dnd` + `uptime` are always present; `bat` is a
+best-effort read (omitted when the build has no usable Power API). `rssi` is
+documented for parity with Buddy but is **not** emitted by `cardputer_mcp.py`.
 
 ```
 {
   "event":  "heartbeat",
-  "bat":    {"pct": 0|25|50|75|100, "usb": bool},
-  "rssi":   -57,           # signed dBm; useful for debugging fade-outs
-  "uptime": 142,           # seconds since this app booted
-  "dnd":    false          # do-not-disturb state
+  "dnd":    false,         # do-not-disturb state (always present)
+  "uptime": 142,           # seconds since this app booted (always present)
+  "bat":    {"pct": 0..100, "usb": bool}   # best-effort; omitted if unavailable
 }
 ```
 

@@ -59,8 +59,14 @@ _RX_CHAR = (RX_UUID, _FLAG_WRITE | _FLAG_WRITE_NR)
 _TX_CHAR = (TX_UUID, _FLAG_READ | _FLAG_NOTIFY)
 _SVC = (SERVICE_UUID, (_RX_CHAR, _TX_CHAR))
 
-_FW_VERSION = "0.3.0"
-_CAPS = ["notify", "ask", "confirm"]
+_FW_VERSION = "0.4.2"
+# Capabilities advertised in `hello`. The host gates tool calls on these:
+#   confirm_details — confirm renders an agent-supplied scrollable action diff
+#   show            — ambient single-line status updates on the idle screen
+#   progress        — ambient channel rendered as a filling 0–100% bar
+# Old hosts ignore caps they don't use; new hosts skip the radio for caps a
+# device doesn't advertise. Keep in sync with /mcp/server.py.
+_CAPS = ["notify", "ask", "confirm", "confirm_details", "show", "progress"]
 _MTU = 20  # default ATT MTU minus framing; chunk every TX write at this
 
 # How long the user must hold Y for `confirm` to succeed. Picked high
@@ -101,6 +107,30 @@ _H = 135
 # idle status display, in ms. Long enough to read a 3-line body
 # comfortably, short enough that a stale notification doesn't loiter.
 _NOTIFY_LINGER_MS = 5000
+
+# How often the device emits a `heartbeat` event (dnd / uptime / battery) to
+# the host while connected. Matches the 10 s cadence the protocol documents
+# and the Buddy app uses, so the host's "30 s silence = gone" heuristic holds.
+_HEARTBEAT_INTERVAL_MS = 10000
+
+# Ambient `show` status: how many channels we keep (newest-first, one line
+# per channel) and how wide each wrapped detail/status line is at size-1
+# DejaVu9 (~6 px/char on the 240-px LCD, leaving a margin).
+_AMBIENT_MAX = 3
+# Chars per wrapped line at size-1 DejaVu9. Held a little under the full
+# width so the confirm details box leaves a right-edge column for the
+# scroll-position arrows.
+_DETAIL_WRAP = 36
+
+# `confirm` action diff: how many wrapped detail lines are visible at once in
+# the scrollable box. The rest scroll into view with the arrow cluster.
+_CONFIRM_DETAIL_VISIBLE = 5
+# Post-parse RAM belt on details length, independent of the host's 256-char
+# wire cap. The wire itself is bounded by the host (256) and by the 512-byte
+# RX-line guard in MCPBLE._irq, so by the time we get here the string is
+# already small; this just caps what we wrap+retain. Headroom over 256 in case
+# a foreign host sends a bit more.
+_CONFIRM_DETAILS_MAX = 320
 
 
 # ---- BLE peripheral ------------------------------------------------
@@ -264,10 +294,10 @@ class MCPBLE:
             conn, handle = data
             if handle == self._rx_h:
                 self._rx_buf += self._ble.gatts_read(self._rx_h)
-                # Split on newline and dispatch one line at a time.
-                # Heavy parsing (json.loads) on the IRQ context is
-                # what Buddy does too — if it gets in the way of
-                # the BLE stack we'll move it behind a queue.
+                # Split on newline and dispatch one line at a time. json.loads
+                # runs here in IRQ context, so the handler must stay quick;
+                # legitimate lines are small (the host caps `confirm` details
+                # so the whole line stays well under the 512-byte RX buffer).
                 while True:
                     nl = self._rx_buf.find(b"\n")
                     if nl < 0:
@@ -276,6 +306,13 @@ class MCPBLE:
                     # MicroPython bytearray doesn't support `del buf[:n]`,
                     # so we copy. Lines are short; cost is negligible.
                     self._rx_buf = bytearray(self._rx_buf[nl + 1 :])
+                    # Guard the IRQ budget: a legitimate line never exceeds the
+                    # 512-byte RX buffer, so anything larger is a buggy/rogue
+                    # host or already-corrupt framing. Drop it rather than risk
+                    # a slow json.loads stalling the BLE stack.
+                    if len(line) > 512:
+                        print("mcp_ble: oversized line, skipping:", len(line))
+                        continue
                     try:
                         msg = json.loads(line)
                         self._on_command(msg)
@@ -448,6 +485,11 @@ class App:
         self.notify_data = None  # {"title", "body", "urgency"}
         self.notify_expires_at = 0
 
+        # Ambient `show` state: newest-first list of {"channel", "text"},
+        # one entry per channel, capped at _AMBIENT_MAX. Rendered on the idle
+        # screen only — it never interrupts a banner or modal.
+        self.ambient = []
+
         # Ask state.
         self.pending_ask = None  # {"id", "question", "choices", "deadline"}
 
@@ -459,10 +501,20 @@ class App:
         self.pending_confirm = None  # {"id", "title", "danger", "deadline"}
         self._y_held_since_ms = None
         self._last_y_seen_ms = None
+        # Scroll offset into a confirm's wrapped action-diff `detail_lines`
+        # (0 = top). Reset on each new confirm; the arrow cluster scrolls it.
+        self._confirm_scroll = 0
 
         # Side-effect queue (set from IRQ, drained in main loop).
         self._dirty = True
         self._pending_chirp = None  # urgency string or None
+
+        # Heartbeat cadence + telemetry state. _bat_ok starts True and flips
+        # off the first time a battery read raises, so a build without a usable
+        # Power API costs one failed read, not one every 10 s forever.
+        self._boot_ms = time.ticks_ms()
+        self._last_hb_ms = self._boot_ms
+        self._bat_ok = True
 
         self.ble = MCPBLE(self._on_command, self._on_state)
 
@@ -495,6 +547,10 @@ class App:
             self._cmd_ask(msg, mid)
         elif cmd == "confirm":
             self._cmd_confirm(msg, mid)
+        elif cmd == "show":
+            self._cmd_show(msg, mid)
+        elif cmd == "progress":
+            self._cmd_progress(msg, mid)
         elif cmd == "ping":
             self.ble.send({"ack": "ping", "id": mid, "ok": True})
         elif cmd == "cancel":
@@ -528,6 +584,57 @@ class App:
             self._dirty = True
         self._pending_chirp = self.notify_data["urgency"]
         self.ble.send({"ack": "notify", "id": mid, "ok": True})
+
+    def _cmd_show(self, msg, mid):
+        """Update one ambient status line (the iter-4 `show` command).
+
+        Silent and non-interrupting by design: no chirp, and we only repaint
+        when the idle screen is actually visible — if a banner or modal is up,
+        the latest text is stored and shown the moment the screen reverts.
+        DND does not apply (there's nothing to disturb). One entry per
+        channel, newest first, capped at _AMBIENT_MAX.
+        """
+        # Strip before the truthiness check (mirrors the host) so a
+        # whitespace-only channel falls back to "agent" instead of becoming a
+        # blank orphan entry in the ring.
+        channel = (str(msg.get("channel", "")).strip() or "agent")[:16]
+        text = str(msg.get("text", ""))[:48]
+        # Replace any existing entry for this channel, then push to front.
+        self.ambient = [e for e in self.ambient if e["channel"] != channel]
+        self.ambient.insert(0, {"channel": channel, "text": text})
+        if len(self.ambient) > _AMBIENT_MAX:
+            self.ambient = self.ambient[:_AMBIENT_MAX]
+        if self.state == "idle":
+            self._dirty = True
+        self.ble.send({"ack": "show", "id": mid, "ok": True})
+
+    def _cmd_progress(self, msg, mid):
+        """Update one ambient channel as a live progress bar (0–100%).
+
+        The silent sibling of `show`: same channel ring, same etiquette (no
+        chirp, repaint only when idle is visible, DND-agnostic), but the entry
+        carries a `pct` so the idle screen renders it as a filling bar instead
+        of a text line. A `progress` and a `show` compete for the same channel
+        slot — the latest write wins, so a channel can flip from a status line
+        to a bar and back. `percent` is clamped to 0..100; a non-numeric value
+        is treated as 0 rather than crashing the BLE IRQ-adjacent parse path.
+        """
+        channel = (str(msg.get("channel", "")).strip() or "agent")[:16]
+        label = str(msg.get("label", ""))[:48]
+        try:
+            pct = int(msg.get("percent", 0))
+        except (TypeError, ValueError):
+            pct = 0
+        pct = 0 if pct < 0 else 100 if pct > 100 else pct
+        # Replace any existing entry for this channel, then push to front —
+        # identical bookkeeping to `_cmd_show` so the ring stays consistent.
+        self.ambient = [e for e in self.ambient if e["channel"] != channel]
+        self.ambient.insert(0, {"channel": channel, "text": label, "pct": pct})
+        if len(self.ambient) > _AMBIENT_MAX:
+            self.ambient = self.ambient[:_AMBIENT_MAX]
+        if self.state == "idle":
+            self._dirty = True
+        self.ble.send({"ack": "progress", "id": mid, "ok": True})
 
     def _cmd_ask(self, msg, mid):
         if self.dnd:
@@ -626,6 +733,13 @@ class App:
         title = str(msg.get("title", ""))[:64]
         timeout_s = max(5, min(120, int(msg.get("timeout_s", 30))))
         danger = bool(msg.get("danger", True))
+        # Optional action diff: the real command/SQL/diff the user is
+        # approving. Pre-wrap once here (not every redraw) so the render path
+        # is cheap. None when absent -> the title-only layout is used verbatim.
+        details = str(msg.get("details", ""))[:_CONFIRM_DETAILS_MAX]
+        # Wrap only when there's real content — a whitespace-only payload
+        # would otherwise render as blank rows in the action-diff box.
+        detail_lines = _wrap_detail_lines(details) if details.strip() else None
 
         if self.pending_ask:
             self.ble.send(
@@ -656,12 +770,14 @@ class App:
             "danger": danger,
             "deadline": time.ticks_add(time.ticks_ms(), timeout_s * 1000),
             "agent": str(msg.get("agent", ""))[:20],
+            "detail_lines": detail_lines,
         }
         # Start with no hold in progress. Even if the user happened to
         # be holding Y from the prior screen, they restart from zero —
         # the new confirm is a fresh consent, not an inherited one.
         self._y_held_since_ms = None
         self._last_y_seen_ms = None
+        self._confirm_scroll = 0
         self.state = "confirm"
         self._dirty = True
         # `crit` chirp regardless of `danger` flag — the audible cue
@@ -676,6 +792,23 @@ class App:
     def handle_keypress(self, k):
         """Return True if the app should exit (back to launcher)."""
         if self.state == "confirm" and self.pending_confirm:
+            # Arrow cluster scrolls the action diff when one is present.
+            # Scrolling does NOT advance the hold (no Y event), so the user
+            # reads the whole diff first, then taps Y to consent.
+            detail_lines = self.pending_confirm.get("detail_lines")
+            if detail_lines:
+                intent = _scroll_intent(k)
+                if intent == "up":
+                    if self._confirm_scroll > 0:
+                        self._confirm_scroll -= 1
+                        self._dirty = True
+                    return False
+                if intent == "down":
+                    max_off = max(0, len(detail_lines) - _CONFIRM_DETAIL_VISIBLE)
+                    if self._confirm_scroll < max_off:
+                        self._confirm_scroll += 1
+                        self._dirty = True
+                    return False
             if isinstance(k, int):
                 # Y / y advances the hold. The actual "did we hit
                 # threshold?" check happens here too so confirmation
@@ -779,6 +912,39 @@ class App:
             return True
         return False
 
+    # --- heartbeat (main-loop context) -----------------------------
+
+    def _build_heartbeat(self, now):
+        """Build the heartbeat event: always the reliable signals (dnd +
+        uptime); battery only as a guarded best-effort (omitted if the build
+        has no usable Power API — same reason Buddy stubs battery)."""
+        hb = {
+            "event": "heartbeat",
+            "dnd": self.dnd,
+            "uptime": time.ticks_diff(now, self._boot_ms) // 1000,
+        }
+        if self._bat_ok:
+            bat = _read_battery()
+            if bat is None:
+                self._bat_ok = False  # don't keep retrying a missing API
+            else:
+                hb["bat"] = bat
+        return hb
+
+    def _maybe_send_heartbeat(self, now):
+        """Emit a heartbeat every _HEARTBEAT_INTERVAL_MS while connected.
+
+        Runs in main-loop (not IRQ) context, so the gatts_notify is safe here.
+        Only fires when connected; on reconnect the first heartbeat goes out
+        promptly since _last_hb_ms is older than the interval.
+        """
+        if not self.ble_connected:
+            return
+        if time.ticks_diff(now, self._last_hb_ms) < _HEARTBEAT_INTERVAL_MS:
+            return
+        self._last_hb_ms = now
+        self.ble.send(self._build_heartbeat(now))
+
     # --- main-loop tick --------------------------------------------
 
     def tick(self):
@@ -790,6 +956,7 @@ class App:
 
         # Timers.
         now = time.ticks_ms()
+        self._maybe_send_heartbeat(now)
         if self.state == "notify":
             if time.ticks_diff(self.notify_expires_at, now) <= 0:
                 self.state = "idle"
@@ -873,25 +1040,86 @@ class App:
             _LCD.setTextColor(_YELLOW, _DARK)
             _LCD.drawString(chip, _W - _LCD.textWidth(chip) - 6, 5)
 
-        # Status line — green when an MCP host is paired, gray otherwise.
         status_text = "READY" if self.ble_connected else "waiting for bridge"
         status_color = _GREEN if self.ble_connected else _GRAY_MID
-        _LCD.setTextSize(2)
-        _LCD.setTextColor(status_color, _BLACK)
-        _LCD.drawString(
-            status_text, (_W - _LCD.textWidth(status_text)) // 2, 42
-        )
 
-        # Device identity — useful when the user has multiple devices
-        # in range or is trying to figure out which one to pair with.
-        _LCD.setTextSize(1)
-        _LCD.setTextColor(_GRAY_MID, _BLACK)
-        _LCD.drawString(self.ble.name, (_W - _LCD.textWidth(self.ble.name)) // 2, 74)
+        if self.ambient:
+            # Live layout: compact status + identity on one row, then the
+            # ambient `show` lines (newest first). The big centered status is
+            # dropped to make room — the agents' status is the point now.
+            _LCD.setTextSize(1)
+            _LCD.setTextColor(status_color, _BLACK)
+            _LCD.drawString(status_text, 6, 26)
+            _LCD.setTextColor(_GRAY_MID, _BLACK)
+            _LCD.drawString(
+                self.ble.name, _W - _LCD.textWidth(self.ble.name) - 6, 26
+            )
+            _LCD.fillRect(0, 40, _W, 1, _DARK)
+            self._draw_ambient(start_y=46)
+        else:
+            # Idle layout — unchanged from before `show` existed: big centered
+            # status + device identity, lots of calm whitespace.
+            _LCD.setTextSize(2)
+            _LCD.setTextColor(status_color, _BLACK)
+            _LCD.drawString(
+                status_text, (_W - _LCD.textWidth(status_text)) // 2, 42
+            )
+            _LCD.setTextSize(1)
+            _LCD.setTextColor(_GRAY_MID, _BLACK)
+            _LCD.drawString(
+                self.ble.name, (_W - _LCD.textWidth(self.ble.name)) // 2, 74
+            )
 
         _LCD.fillRect(0, _H - 18, _W, 18, _DARK)
         _LCD.setTextColor(_GRAY_MID, _DARK)
         hint = "Q menu   D:DND {}".format("on" if self.dnd else "off")
         _LCD.drawString(hint, (_W - _LCD.textWidth(hint)) // 2, _H - 14)
+
+    def _draw_ambient(self, start_y):
+        """Render the ambient rows (channel in orange) one per row from
+        `start_y`. A `show` entry draws its text in cream; a `progress` entry
+        (one carrying `pct`) draws a filling bar instead. Caller has already
+        cleared the area."""
+        _LCD.setTextSize(1)
+        y = start_y
+        for e in self.ambient[:_AMBIENT_MAX]:
+            chan = (e.get("channel") or "agent")[:12]
+            _LCD.setTextColor(_ORANGE, _BLACK)
+            _LCD.drawString(chan, 6, y)
+            if "pct" in e:
+                self._draw_progress_row(e, chan, y)
+            else:
+                text_x = 6 + _LCD.textWidth(chan + " ")
+                # Trim text to the remaining char budget on the row so it
+                # doesn't run off the 240-px edge (the channel ate part of it).
+                budget = _DETAIL_WRAP - len(chan) - 1
+                text = e.get("text", "")[:budget] if budget > 0 else ""
+                _LCD.setTextColor(_CREAM, _BLACK)
+                _LCD.drawString(text, text_x, y)
+            y += 14
+
+    def _draw_progress_row(self, e, chan, y):
+        """Render one ambient entry as a labeled progress bar: the channel tag
+        (already drawn by the caller at x=6), then a bordered bar filling green
+        in proportion to `pct`, with the percentage hard against the right
+        edge. The bar lives in the gap between a fixed left gutter and the
+        percentage so every row's bars line up regardless of tag width."""
+        pct = e.get("pct", 0)
+        pct_str = "%d%%" % pct
+        pct_w = _LCD.textWidth(pct_str)
+        _LCD.setTextColor(_CREAM, _BLACK)
+        _LCD.drawString(pct_str, _W - 6 - pct_w, y)
+        # Fixed left gutter (~8 chars) keeps the bars aligned column-wise even
+        # as channel tags vary in length; the bar fills to just left of "NN%".
+        bar_x = 6 + _LCD.textWidth("XXXXXXXX ")
+        bar_w = (_W - 6 - pct_w - 6) - bar_x
+        bar_h = 8
+        bar_y = y + 1
+        if bar_w > 8:
+            _LCD.drawRect(bar_x, bar_y, bar_w, bar_h, _GRAY_MID)
+            fill = (bar_w - 2) * pct // 100
+            if fill > 0:
+                _LCD.fillRect(bar_x + 1, bar_y + 1, fill, bar_h - 2, _GREEN)
 
     def _draw_notify(self):
         if not self.notify_data:
@@ -981,6 +1209,11 @@ class App:
 
     def _draw_confirm(self):
         if not self.pending_confirm:
+            return
+        # With an action diff, use the dense scrollable layout. Without one,
+        # fall through to the original title-only screen verbatim.
+        if self.pending_confirm.get("detail_lines"):
+            self._draw_confirm_details()
             return
 
         _LCD.fillScreen(_BLACK)
@@ -1075,6 +1308,92 @@ class App:
         hint = "TAP Y - N/ESC cancel"
         _LCD.drawString(hint, (_W - _LCD.textWidth(hint)) // 2, _H - 14)
 
+    def _draw_confirm_details(self):
+        """Confirm screen WITH a scrollable action diff (the verified-approval
+        / hardware-wallet layout). The user reads the real command/SQL/diff,
+        scrolls with the arrow cluster, then taps Y to consent. Denser than the
+        title-only screen; the title-only path above is left untouched.
+        """
+        pc = self.pending_confirm
+        lines = pc.get("detail_lines") or []
+
+        _LCD.fillScreen(_BLACK)
+
+        # Same red danger chrome as the title-only screen so the gesture's
+        # meaning is unmistakable — only the body is denser.
+        _LCD.fillRect(0, 0, _W, 20, _RED)
+        _LCD.fillRect(0, 20, _W, 1, _ORANGE)
+        _LCD.setTextSize(1)
+        _LCD.setTextColor(_CREAM, _RED)
+        _LCD.drawString("DANGER  CONFIRM", 6, 5)
+
+        agent = pc.get("agent") or ""
+        if agent:
+            label = "from:" + agent[:14]
+            _LCD.setTextColor(_CREAM, _RED)
+            _LCD.drawString(label, _W - _LCD.textWidth(label) - 6, 5)
+
+        scroll = self._confirm_scroll
+        total = len(lines)
+        scrollable = total > _CONFIRM_DETAIL_VISIBLE
+
+        # Title (the WHAT) — compact, one line. When the diff scrolls, a
+        # position indicator ("3-7/12") sits right-aligned in the title row —
+        # NOT over the content lines — so it can never obscure a diff line.
+        _LCD.setTextSize(1)
+        title_max = _DETAIL_WRAP
+        if scrollable:
+            last = min(scroll + _CONFIRM_DETAIL_VISIBLE, total)
+            ind = "{}-{}/{}".format(scroll + 1, last, total)
+            _LCD.setTextColor(_ORANGE, _BLACK)
+            _LCD.drawString(ind, _W - _LCD.textWidth(ind) - 6, 24)
+            title_max = 22  # leave room for the indicator
+        _LCD.setTextColor(_CREAM, _BLACK)
+        _LCD.drawString(pc["title"][:title_max], 6, 24)
+
+        # Scrollable details window: _CONFIRM_DETAIL_VISIBLE lines from the
+        # current scroll offset.
+        visible = lines[scroll : scroll + _CONFIRM_DETAIL_VISIBLE]
+        y = 38
+        _LCD.setTextColor(_CREAM, _BLACK)
+        for line in visible:
+            _LCD.drawString(line, 6, y)
+            y += 12
+
+        # Progress bar — thinner than the title-only screen to fit the diff.
+        bar_w = 220
+        bar_h = 7
+        bar_x = (_W - bar_w) // 2
+        bar_y = 99
+        _LCD.drawRect(bar_x, bar_y, bar_w, bar_h, _CREAM)
+        if self._y_held_since_ms is not None:
+            held_ms = time.ticks_diff(time.ticks_ms(), self._y_held_since_ms)
+            progress = held_ms / _CONFIRM_HOLD_MS
+            if progress > 1.0:
+                progress = 1.0
+            elif progress < 0.0:
+                progress = 0.0
+            fill_w = int((bar_w - 2) * progress)
+            if fill_w > 0:
+                _LCD.fillRect(bar_x + 1, bar_y + 1, fill_w, bar_h - 2, _RED)
+
+        # The hint strip doubles as the live hold/scroll status to reclaim the
+        # vertical space the diff consumes.
+        _LCD.fillRect(0, _H - 18, _W, 18, _DARK)
+        if self._y_held_since_ms is not None:
+            held_ms = time.ticks_diff(time.ticks_ms(), self._y_held_since_ms)
+            secs = max(0, _CONFIRM_HOLD_MS - held_ms) / 1000.0
+            hint = "TAP Y {:.1f}s".format(secs)
+            color = _CREAM
+        else:
+            hint = "TAP Y rapidly"
+            color = _GRAY_MID
+        if len(lines) > _CONFIRM_DETAIL_VISIBLE:
+            hint += "  ;/. scroll"
+        hint += "  N cancel"
+        _LCD.setTextColor(color, _DARK)
+        _LCD.drawString(hint, (_W - _LCD.textWidth(hint)) // 2, _H - 14)
+
     def teardown(self):
         """Best-effort cleanup before the launcher returns.
 
@@ -1136,6 +1455,76 @@ def _is_q(k):
     if isinstance(k, str) and k:
         return k.lower() == "q"
     return False
+
+
+def _scroll_intent(k):
+    """Return 'up' / 'down' for the Cardputer arrow cluster (`;`/`,` = up,
+    `.`/`/` = down), matching the mapping the launcher and the other apps use.
+    None for anything that isn't a scroll key.
+    """
+    if k is None:
+        return None
+    if isinstance(k, int):
+        if 0x20 <= k <= 0x7E:
+            k = chr(k)
+        else:
+            return None
+    if not isinstance(k, str) or not k:
+        return None
+    ch = k.lower()
+    if ch in (";", ","):
+        return "up"
+    if ch in (".", "/"):
+        return "down"
+    return None
+
+
+def _wrap_detail_lines(text, width=_DETAIL_WRAP, max_lines=40):
+    """Wrap confirm action-diff `text` into display rows.
+
+    Splits on newlines first (so each command/SQL/diff line keeps its own
+    row), then hard-wraps any overlong row at `width` chars. Bounded to
+    `max_lines` so a pathological payload can't grow unbounded on the device.
+    """
+    out = []
+    for raw in text.split("\n"):
+        raw = raw.rstrip("\r")
+        if raw == "":
+            out.append("")
+        else:
+            i = 0
+            n = len(raw)
+            while i < n:
+                out.append(raw[i : i + width])
+                i += width
+        if len(out) >= max_lines:
+            break
+    return out[:max_lines]
+
+
+def _read_battery():
+    """Best-effort battery read as ``{"pct": int, "usb": bool}`` or ``None``.
+
+    M5's Power API varies across UIFlow builds (it's why Buddy stubs battery),
+    so every access is guarded and any failure yields ``None`` — the caller
+    then drops battery from the heartbeat and stops retrying. Never raises.
+    """
+    try:
+        power = M5.Power
+    except Exception:
+        return None
+    try:
+        pct = int(power.getBatteryLevel())
+    except Exception:
+        return None
+    if pct < 0 or pct > 100:
+        return None
+    usb = False
+    try:
+        usb = bool(power.isCharging())
+    except Exception:
+        usb = False
+    return {"pct": pct, "usb": usb}
 
 
 def _chirp(urgency):

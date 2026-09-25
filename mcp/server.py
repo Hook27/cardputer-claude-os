@@ -17,7 +17,7 @@ fail all in-flight RPCs cleanly so the client gets a real error
 rather than a hung tool.
 
 Why FastMCP rather than the low-level Server API: this server's tool
-surface is small (five tools at full build-out), each with a clean
+surface is small (six tools at full build-out), each with a clean
 typed signature. FastMCP's decorator style keeps the call-site code
 close to the description text, which is what we'll iterate on most
 often as we tune Claude's tool-selection behavior.
@@ -39,7 +39,9 @@ from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from mcp.server.fastmcp import Context, FastMCP
 
+from audit import ConsentAuditLog
 from auth import label_for_authorization
+from ratelimit import MinIntervalLimiter
 
 
 # ---- protocol constants --------------------------------------------
@@ -59,6 +61,15 @@ NAME_PREFIX = "CardputerMCP_"
 SCAN_TIMEOUT_S = 5.0
 HELLO_TIMEOUT_S = 5.0
 DEFAULT_RPC_TIMEOUT_S = 30.0
+
+# Max length of the optional `confirm` action-diff `details` payload. Kept
+# deliberately small for TWO device limits: (1) the device parses each inbound
+# JSON line in BLE IRQ context (see cardputer_mcp.py), so the line must stay
+# well inside the ~5 ms IRQ budget; (2) the device's RX reassembly buffer is
+# 512 bytes — the full confirm line (cmd+id+agent+title≤64+flags+details) must
+# fit under it. Worst case here ≈ 195 B of envelope + 256 B details ≈ 451 B,
+# leaving comfortable margin. ~256 chars still scrolls to ~7 lines of diff.
+_CONFIRM_DETAILS_MAX = 256
 
 # When connection fails, suppress retries for this long so we don't
 # stall every tool call with a fresh 5-second scan when the device
@@ -125,6 +136,13 @@ class Bridge:
     def __init__(self) -> None:
         self.client: Optional[BleakClient] = None
         self.hello: Optional[dict] = None
+
+        # Latest device heartbeat (dnd / uptime / battery) and when we saw it,
+        # cached so the read-only `device_status` tool can report device state
+        # without a round-trip. Cleared on disconnect so stale state can't
+        # outlive the link.
+        self.last_heartbeat: Optional[dict] = None
+        self.last_heartbeat_at: Optional[float] = None
 
         self._rx_buf = bytearray()
         self._pending: dict[str, asyncio.Future] = {}
@@ -282,6 +300,10 @@ class Bridge:
         _log("BLE disconnected")
         self.hello = None
         self._hello_event.clear()
+        # Drop cached telemetry so device_status can't report a stale dnd /
+        # battery for a device that's no longer on the other end of the link.
+        self.last_heartbeat = None
+        self.last_heartbeat_at = None
         for mid, fut in list(self._pending.items()):
             if not fut.done():
                 fut.set_exception(
@@ -316,9 +338,12 @@ class Bridge:
                 self.hello = msg
                 self._hello_event.set()
             elif ev == "heartbeat":
-                # Heartbeats are advisory in iter 2. Iter 3+ will use
-                # them for battery display and DND-state propagation.
-                pass
+                # Device liveness + DND/battery telemetry (fw 0.4.1+). Cache it
+                # so `device_status` can report without waking the radio. A
+                # pre-0.4.1 device simply never sends these, and the tool falls
+                # back to connection + hello info.
+                self.last_heartbeat = msg
+                self.last_heartbeat_at = time.monotonic()
             else:
                 _log(f"unknown event: {ev}")
             return
@@ -419,6 +444,48 @@ class Bridge:
 bridge = Bridge()
 mcp = FastMCP("cardputer")
 
+
+def _notify_min_interval_s() -> float:
+    """Read the per-agent notify floor from the environment (seconds).
+
+    Default 60 s; set CARDPUTER_NOTIFY_MIN_INTERVAL_S=0 to disable. A
+    malformed value falls back to the default rather than crashing the daemon.
+    """
+    try:
+        return float(os.environ.get("CARDPUTER_NOTIFY_MIN_INTERVAL_S", "60"))
+    except ValueError:
+        return 60.0
+
+
+# Backstop for the "default to silence" etiquette the companion skill asks of
+# agents (see ratelimit.py). Keyed by the token-derived agent label so one
+# chatty agent can't bury the device or starve another agent's alerts. `crit`
+# notifies and the blocking tools (ask/confirm) bypass it at the call site.
+_notify_limiter = MinIntervalLimiter(_notify_min_interval_s())
+
+
+def _audit_log_path() -> Optional[Path]:
+    """Resolve where `confirm` decisions are logged (see audit.py).
+
+    Defaults to ~/.cardputer-mcp/audit.log — a sibling of the pairing cache, so
+    the daemon's private state stays in one place. Set CARDPUTER_AUDIT_LOG to
+    an explicit path to relocate it, or to an empty string to disable the
+    consent trail entirely (some operators won't want any on-disk record).
+    """
+    raw = os.environ.get("CARDPUTER_AUDIT_LOG")
+    if raw is None:
+        return PAIR_CACHE_DIR / "audit.log"
+    raw = raw.strip()
+    return Path(raw).expanduser() if raw else None
+
+
+# Append-only JSONL trail of every `confirm` decision (agent, title, the
+# action-diff the user approved, outcome, hold duration). The honest,
+# non-cryptographic first rung of the signed-consent-receipts roadmap item:
+# it answers "what did an agent get me to approve, and when?" long after the
+# physical gesture is over. Best-effort — a log failure never breaks a confirm.
+_audit = ConsentAuditLog(_audit_log_path(), warn=_log)
+
 # Populated by build_http_app() in HTTP mode: maps bearer token -> agent
 # label. Read by _agent_label() so the device banner can show *which*
 # agent is asking. Empty in stdio mode (there's no HTTP request to read a
@@ -465,13 +532,23 @@ async def notify(
     is an urgent triple-beep. Prefer 'info' for most uses; reserve
     'crit' for things the user needs to react to within seconds.
 
-    Do not call this in rapid succession — agents that spam
-    notifications get muted by the device's per-agent rate limit
-    (roughly 1 per 60 s) in a later iteration. Returns 'shown',
-    'unavailable: <reason>', or 'failed: <reason>'.
+    Do not call this in rapid succession. The daemon enforces a per-agent
+    floor (default ~1 non-critical notify per 60 s, set by
+    CARDPUTER_NOTIFY_MIN_INTERVAL_S): a non-critical notify sent inside that
+    window returns 'rate-limited' without reaching the device. 'crit'
+    notifications always bypass the floor, so reserve 'crit' for things the
+    user must react to within seconds. Returns 'shown', 'rate-limited',
+    'dnd', 'unavailable: <reason>', or 'failed: <reason>'.
     """
     title = title[:64]
     body = body[:240]
+    agent = _agent_label(ctx)
+    # Per-agent backstop for the "default to silence" etiquette: a
+    # non-critical notify from an agent that just buzzed is dropped before it
+    # reaches the radio, so one chatty agent can't bury the device. `crit`
+    # always rings — a real emergency is exactly what the floor must not eat.
+    if urgency != "crit" and not _notify_limiter.allow(agent):
+        return "rate-limited"
     # Notify is non-blocking on the device, so the RPC should resolve
     # within milliseconds. 10 s is generous slack for radio + device
     # render — if it exceeds that something is wrong.
@@ -479,7 +556,7 @@ async def notify(
         "notify",
         {"title": title, "body": body, "urgency": urgency},
         rpc_timeout_s=10,
-        agent=_agent_label(ctx),
+        agent=agent,
     )
     if result.get("ok"):
         return "shown"
@@ -565,6 +642,7 @@ async def ask(
 async def confirm(
     ctx: Context,
     title: str,
+    details: str = "",
     timeout_s: int = 30,
 ) -> str:
     """Demand physical confirmation from the user before executing a
@@ -586,8 +664,21 @@ async def confirm(
     minute, use this instead of trusting an `ask` or your own
     assistant-message confirmation.
 
+    PASS `details` whenever you can. It is the *actual content* being
+    approved — the real shell command, the SQL statement, a short diff
+    hunk, the payee + amount, or the list of files. On firmware that
+    supports it (fw >= 0.4.0) `details` is rendered in a scrollable box
+    ABOVE the gesture, so the user approves *what they read*, not just an
+    18-character title — the hardware-wallet model. Keep it to the
+    essential ~256 characters (it's truncated past that); strip noise so
+    the operation is legible on a 240×135 screen. NOTE: `details` is
+    text you supply, so it adds *legibility of intent* — it is not a
+    cryptographic proof, and the un-forgeable consent remains the
+    physical hold. Older firmware ignores `details` and shows the title
+    only, so the `title` must still stand on its own.
+
     Returns one of:
-      - 'confirmed' — user completed the ~3 s physical Y gesture
+      - 'confirmed (held <N> ms)' — user completed the ~3 s physical Y gesture
       - 'cancelled' — user pressed N or ESC on the device
       - 'timeout' — user did not respond within `timeout_s` seconds
       - 'unavailable: <reason>' — device not connected
@@ -604,6 +695,9 @@ async def confirm(
     where wrong = bad.
     """
     title = title[:64]
+    # Preserve internal whitespace (diffs/commands are indentation-sensitive),
+    # but cap the length. The strip()-check below decides whether to send it.
+    details = str(details)[:_CONFIRM_DETAILS_MAX]
     if timeout_s < 5 or timeout_s > 120:
         return "error: timeout_s must be between 5 and 120"
 
@@ -612,27 +706,212 @@ async def confirm(
     # slack the host can race the device and report rpc-timeout
     # while the user is mid-hold.
     rpc_timeout = timeout_s + 10
+    payload = {"title": title, "danger": True, "timeout_s": timeout_s}
+    # Send `details` only when it carries real content (strip()-check) so an
+    # empty/whitespace string never bloats the BLE line or renders as blank
+    # rows. Old firmware ignores the field; new firmware renders it as a
+    # scrollable action diff (capability `confirm_details`).
+    if details.strip():
+        payload["details"] = details
+    agent = _agent_label(ctx)
     result = await bridge.send(
         "confirm",
-        {"title": title, "danger": True, "timeout_s": timeout_s},
+        payload,
         rpc_timeout_s=rpc_timeout,
-        agent=_agent_label(ctx),
+        agent=agent,
     )
 
+    # Classify the outcome once, then both return it to the caller and append
+    # it to the consent audit trail. Every branch — approved, denied, timed
+    # out, unreachable — is a decision worth recording; only the pre-send
+    # validation errors above (which never reached the device) are not.
     if result.get("ok") and result.get("confirmed"):
         # We surface the recorded hold duration to encourage tools
         # that want to log it — most callers will just check the
         # 'confirmed' prefix and move on.
         hold_ms = result.get("hold_ms", 0)
-        return f"confirmed (held {hold_ms} ms)"
-    if result.get("cancelled"):
-        return "cancelled"
-    if result.get("timed_out"):
-        return "timeout"
+        outcome, ret = "confirmed", f"confirmed (held {hold_ms} ms)"
+    elif result.get("cancelled"):
+        hold_ms, outcome, ret = None, "cancelled", "cancelled"
+    elif result.get("timed_out"):
+        hold_ms, outcome, ret = None, "timeout", "timeout"
+    else:
+        hold_ms = None
+        err = result.get("err", "unknown")
+        if err.startswith("unavailable"):
+            outcome, ret = "unavailable", err
+        else:
+            outcome, ret = "failed", f"failed: {err}"
+
+    _audit.record(
+        tool="confirm",
+        agent=agent,
+        title=title,
+        details=details if details.strip() else None,
+        outcome=outcome,
+        hold_ms=hold_ms,
+    )
+    return ret
+
+
+@mcp.tool()
+async def show(
+    ctx: Context,
+    text: str,
+    channel: str = "",
+) -> str:
+    """Update a single ambient status line on the user's Cardputer.
+
+    Non-blocking, silent, and unobtrusive — unlike `notify`, this makes no
+    sound and never takes over the screen. It writes one line to a small
+    status area on the device's idle screen so the user can *glance* at their
+    pocket and see what you're doing right now ("running pytest", "wrote
+    auth.py", "idle ok"). Think of it as a status bar, not an alert.
+
+    Use it to keep a live heartbeat of a long task visible without buzzing the
+    user. Call it as your work progresses; each call replaces the previous
+    line for the same `channel`. `channel` is a short tag (defaults to your
+    agent label) so several agents can each own a line — the device keeps the
+    most recent few. Keep `text` to ~40 characters (the LCD is 240×135).
+
+    Because it's ambient it does NOT honor Do Not Disturb (there's nothing to
+    disturb: no sound, no takeover) and it is NOT rate-limited — but update at
+    a human-readable cadence, not on every token.
+
+    Returns 'shown', 'unavailable: <reason>' if the device isn't connected, or
+    'failed: <reason>' (e.g. older firmware that doesn't support `show`).
+    """
+    text = str(text)[:48]
+    agent = _agent_label(ctx)
+    # Channel defaults to the (unforgeable, token-derived) agent label so each
+    # agent owns its own status line without having to invent a tag.
+    channel = (str(channel).strip() or agent)[:16]
+    result = await bridge.send(
+        "show",
+        {"text": text, "channel": channel},
+        rpc_timeout_s=5,
+        agent=agent,
+    )
+    if result.get("ok"):
+        return "shown"
     err = result.get("err", "unknown")
     if err.startswith("unavailable"):
         return err
     return f"failed: {err}"
+
+
+@mcp.tool()
+async def progress(
+    ctx: Context,
+    label: str,
+    percent: int,
+    channel: str = "",
+) -> str:
+    """Show a live progress bar (0–100%) on the user's Cardputer.
+
+    The visual sibling of `show`: non-blocking, silent, never takes over the
+    screen. Instead of a text line it draws a labeled bar that fills as the
+    `percent` you pass climbs, so the user can glance at their pocket and see
+    *how far along* a long task is — building, downloading, a test sweep, a
+    multi-step migration. Think progress indicator, not alert.
+
+    Call it repeatedly as the work advances (e.g. 0, 25, 60, 100). Each call
+    replaces the bar for the same `channel`, a short tag that defaults to your
+    agent label so several agents can each own a bar — the device keeps the
+    most recent few. `percent` is clamped to 0..100. Keep `label` short (~12
+    chars share the row with the bar; the LCD is 240×135). A `progress` and a
+    `show` on the same channel share one slot, latest wins — so you can flip a
+    channel from a status line to a bar and, at 100%, back to "done".
+
+    Because it's ambient it does NOT honor Do Not Disturb (nothing to disturb:
+    no sound, no takeover) and is NOT rate-limited — but update at a
+    human-readable cadence, not on every token.
+
+    Returns 'shown', 'unavailable: <reason>' if the device isn't connected, or
+    'failed: <reason>' (e.g. firmware older than 0.4.2 that lacks `progress`).
+    """
+    try:
+        pct = int(percent)
+    except (TypeError, ValueError):
+        return "error: percent must be an integer 0-100"
+    pct = 0 if pct < 0 else 100 if pct > 100 else pct
+    label = str(label)[:48]
+    agent = _agent_label(ctx)
+    # Channel defaults to the (unforgeable, token-derived) agent label so each
+    # agent owns its own bar without inventing a tag — mirrors `show`.
+    channel = (str(channel).strip() or agent)[:16]
+    result = await bridge.send(
+        "progress",
+        {"label": label, "percent": pct, "channel": channel},
+        rpc_timeout_s=5,
+        agent=agent,
+    )
+    if result.get("ok"):
+        return "shown"
+    err = result.get("err", "unknown")
+    if err.startswith("unavailable"):
+        return err
+    return f"failed: {err}"
+
+
+@mcp.tool()
+async def device_status() -> str:
+    """Report whether the user's Cardputer is reachable and its current state.
+
+    READ-ONLY and passive: returns the bridge's *cached* view — it does NOT
+    wake the radio, scan, or block. Call it to decide whether to interrupt the
+    user: if the device is offline or in Do Not Disturb, prefer staying quiet
+    (or fall back to chat) rather than firing a `notify`/`ask` that will bounce.
+    Also handy to learn which tools the connected firmware supports (`caps`).
+
+    Returns a one-line summary, e.g.
+      'online; dnd=off; fw=0.4.2;
+       caps=notify,ask,confirm,confirm_details,show,progress;
+       uptime=142s; battery=87%; heartbeat 3s ago'
+    or 'offline (device off, out of BLE range, or not yet connected this
+    session)'.
+
+    The view is only as fresh as the last heartbeat (~10 s) or the last tool
+    call — to *actively* reach the device, just call notify/ask/confirm, which
+    connect on demand and fail closed if it's unreachable.
+    """
+    connected = bool(
+        bridge.client and bridge.client.is_connected and bridge.hello
+    )
+    if not connected:
+        return (
+            "offline (device off, out of BLE range, or not yet connected "
+            "this session)"
+        )
+
+    hello = bridge.hello or {}
+    hb = bridge.last_heartbeat or {}
+    parts = ["online"]
+
+    dnd = hb.get("dnd")
+    parts.append("dnd=" + ("on" if dnd else "off") if dnd is not None else "dnd=unknown")
+
+    ver = hello.get("version")
+    if ver:
+        parts.append("fw=" + str(ver))
+    caps = hello.get("caps") or []
+    if caps:
+        parts.append("caps=" + ",".join(str(c) for c in caps))
+
+    up = hb.get("uptime")
+    if isinstance(up, (int, float)):
+        parts.append("uptime={}s".format(int(up)))
+
+    bat = hb.get("bat")
+    if isinstance(bat, dict) and isinstance(bat.get("pct"), (int, float)):
+        charging = " (charging)" if bat.get("usb") else ""
+        parts.append("battery={}%{}".format(int(bat["pct"]), charging))
+
+    if bridge.last_heartbeat_at is not None:
+        age = max(0, int(time.monotonic() - bridge.last_heartbeat_at))
+        parts.append("heartbeat {}s ago".format(age))
+
+    return "; ".join(parts)
 
 
 # ---- HTTP transport (the cloud-bridge path, via an MCP tunnel) ------

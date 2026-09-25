@@ -12,15 +12,17 @@ status — all without the user needing to refocus to their laptop.
 ## Status — iteration 3 (confirm gesture; the 2FA-for-AI moment)
 
 The host-side bridge speaks Bluetooth Low Energy via `bleak` to the
-`cardputer_mcp.py` device app. Three tools work end-to-end:
+`cardputer_mcp.py` device app. These tools work end-to-end:
 
-| Tool                                | iter 2                           | iter 3                             | iter 4                      |
-| ----------------------------------- | -------------------------------- | ---------------------------------- | --------------------------- |
-| `notify(title, body, urgency)`      | ✅ visual banner + speaker chirp | rate-limit, per-agent tags         | —                           |
-| `ask(question, choices, timeout_s)` | ✅ blocks on QWERTY input        | DND awareness                      | —                           |
-| `confirm(title, timeout_s)`         | —                                | ✅ TAP-Y-fast 3 s physical gesture | —                           |
-| `show(text, channel)`               | —                                | —                                  | ambient line on LCD         |
-| `dictate(prompt, max_seconds)`      | —                                | —                                  | mic → Worker/Whisper → text |
+| Tool                                 | iter 2                           | iter 3                             | iter 4 +                            |
+| ------------------------------------ | -------------------------------- | ---------------------------------- | ----------------------------------- |
+| `notify(title, body, urgency)`       | ✅ visual banner + speaker chirp | ✅ per-agent rate-limit + tags     | —                                   |
+| `ask(question, choices, timeout_s)`  | ✅ blocks on QWERTY input        | ✅ DND awareness                   | —                                   |
+| `confirm(title, details, timeout_s)` | —                                | ✅ TAP-Y-fast 3 s physical gesture | ✅ scrollable action diff (details) |
+| `show(text, channel)`                | —                                | —                                  | ✅ ambient line on LCD              |
+| `progress(label, percent, channel)`  | —                                | —                                  | ✅ ambient 0–100% bar (fw 0.4.2)    |
+| `device_status()`                    | —                                | —                                  | ✅ read-only reachability/DND/caps  |
+| `dictate(prompt, max_seconds)`       | —                                | —                                  | mic → Worker/Whisper → text         |
 
 `confirm` is the differentiator. It demands a physical, sustained
 gesture from the user before returning success — a prompt injection
@@ -227,22 +229,69 @@ but its gesture is less polished than the brand promised.
   `machine.reset()` on app exit clears the stack anyway. Pick one
   from the launcher menu.
 
+## Consent audit log
+
+Every `confirm` decision is appended to a local, append-only JSONL trail at
+`~/.cardputer-mcp/audit.log` (a sibling of the pairing cache). The physical
+hold is the un-forgeable consent in the moment; the audit log is what lets you
+answer _"what did an agent get me to approve, and when?"_ long after the
+gesture is over. It records **decisions, not just approvals** — a denial or a
+timeout lands on the record too:
+
+```json
+{"ts": 1751250000.42, "tool": "confirm", "agent": "managed-agent", "title": "DROP customers", "outcome": "confirmed", "details": "DELETE FROM customers;", "hold_ms": 3210}
+{"ts": 1751250120.11, "tool": "confirm", "agent": "claude-code", "title": "force push origin/main", "outcome": "cancelled"}
+```
+
+- `agent` is the **token-derived** label (the same unforgeable identity shown
+  on the device banner), not caller-supplied text — an injected agent can't
+  forge who asked.
+- `details` is the action diff the user actually read and approved, so the
+  record captures _what_ was consented to, not just an 18-char title. Omitted
+  when the caller sent none.
+- `outcome` is one of `confirmed` / `cancelled` / `timeout` / `unavailable` /
+  `failed`. Pre-send validation errors (bad `timeout_s`) never reached the
+  device, so they are **not** logged — the trail is decisions only.
+
+Writing is strictly best-effort: an audit-log failure (bad path, full disk)
+never breaks a confirm — it's logged to stderr and the round-trip proceeds.
+Set `CARDPUTER_AUDIT_LOG=/some/path` to relocate the file, or
+`CARDPUTER_AUDIT_LOG=""` to disable the trail entirely. This is the honest,
+non-cryptographic first rung of the signed-consent-receipts ladder below;
+the record is authored by the daemon you run, not by the requesting agent.
+
 ## Roadmap
 
 - [x] iter 1: scaffold with stubbed transport
 - [x] iter 2: real BLE transport; `notify` and `ask` end-to-end
 - [x] iter 3: `confirm` with hold-Y-3s physical gesture
-- [~] iter 4: DND switch ✅ + per-agent identity on the banner ✅;
-  `show` (ambient line) / `dictate` (mic → Whisper) still pending
+- [x] iter 4: DND switch ✅ + per-agent identity on the banner ✅ +
+      `show` ambient status line ✅ + per-agent notify rate-limit ✅
+      (`ratelimit.py`); `dictate` (mic → Whisper) still pending
 - [x] iter 5: **cloud agents via MCP tunnel** — a streamable-http daemon
       (`CARDPUTER_HTTP=1`) behind `cloudflared` + `mcp-proxy`, reached by
       Managed Agents / the Messages API. Replaces the originally-planned
       bespoke Worker bridge with Anthropic's productized MCP tunnel. See
       `/tunnel/` and `/docs/superpowers/`.
+- [x] **verified approval**: `confirm(details=…)` renders an agent-supplied
+      scrollable action diff (the real command / SQL / diff / payee) above the
+      hold-Y gesture (fw `0.4.0`, cap `confirm_details`) — you approve _what
+      you read_, the hardware-wallet model.
+- [x] **situational awareness**: the device emits `heartbeat` telemetry
+      (dnd / uptime / best-effort battery, fw `0.4.1`) and a read-only
+      `device_status` tool lets agents check reachability + DND + caps before
+      deciding to interrupt — instead of firing a notify that just bounces.
+- [x] **consent audit log**: every `confirm` decision (agent, title, the
+      approved action diff, outcome, hold duration) is appended to a local
+      append-only JSONL trail at `~/.cardputer-mcp/audit.log` — the honest,
+      daemon-authored first rung of the signed-consent-receipts ladder. See
+      _Consent audit log_ above.
 - [ ] iter 6: inverse direction — programmable launcher buttons
       that fire Managed Agents tasks
-- [ ] later: signed-consent receipts, on-device action diff, multi-party
-      quorum (documented future ladder in the design spec)
+- [ ] later: **trusted daemon-computed** action diffs (so the agent can't
+      author the text it asks you to approve), **cryptographically** signed
+      consent receipts (this log, but tamper-evident), and multi-party quorum
+      (the future ladder in the design spec)
 
 ## License
 
