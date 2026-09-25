@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude-verbruik</title>
+<style>
+  /* Statusscherm voor de Nest Hub: 7 inch, 1024x600, bekeken van ± 3 m.
+     Eén ontwerpeenheid (--u) is 1/100 van de schermhoogte; op de Hub 6 px,
+     ongeveer 0,9 mm. De percentages zijn 36u groot (± 2,3 cm cijferhoogte),
+     label en resettijd 13u (± 0,85 cm). Door de min() blijft het geheel in
+     verhouding als het venster een andere vorm heeft, zoals op de laptop.
+     De achtergrond staat er expliciet: de Hub rendert een pagina zonder
+     achtergrond zwart, en standaardtekst is ook zwart (test 2026-09-25). */
+  :root {
+    --bg: #0b0e12;
+    --tekst: #e8edf2;
+    --gedimd: #9aa6b2;
+    --spoor: #1f2933;
+    --ok: #5fbfa3;
+    --warn: #e6a94f;
+    --crit: #ff7a70;
+    --u: min(1vh, 0.5859vw);
+    --mono: "Roboto Mono", "Noto Sans Mono", "DejaVu Sans Mono", "Cascadia Mono", Consolas, monospace;
+    --sans: Roboto, "Noto Sans", "Segoe UI", system-ui, sans-serif;
+  }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--tekst); }
+  body { display: grid; place-items: center; font-family: var(--sans); }
+  main {
+    box-sizing: border-box;
+    width: calc(170.67 * var(--u));
+    height: calc(100 * var(--u));
+    padding: calc(5 * var(--u)) calc(6 * var(--u)) calc(3 * var(--u));
+    display: grid;
+    /* minmax(0, ...): anders duwt een lange voetregel (nowrap) de kolom
+       breder dan het scherm en valt de rechterkant weg. */
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 1fr auto;
+    gap: calc(3 * var(--u));
+  }
+  .meters { display: grid; grid-template-columns: 1fr 1fr; gap: calc(8 * var(--u)); min-width: 0; }
+  .meter { display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+  .label {
+    font-size: calc(13 * var(--u)); font-weight: 600; line-height: 1;
+    letter-spacing: .06em; text-transform: uppercase; color: var(--gedimd);
+  }
+  .getal {
+    font-family: var(--mono); font-size: calc(36 * var(--u)); font-weight: 600; line-height: 1;
+    margin-top: calc(3 * var(--u)); font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .getal .pct { font-size: .4em; margin-left: .05em; color: var(--gedimd); }
+  .balk {
+    height: calc(5 * var(--u)); margin-top: calc(2 * var(--u));
+    background: var(--spoor); border-radius: var(--u); overflow: hidden;
+  }
+  .vulling { height: 100%; width: 0; background: var(--ok); transition: width .6s ease; }
+  .reset { margin-top: calc(4 * var(--u)); display: flex; align-items: baseline; gap: calc(2.5 * var(--u)); white-space: nowrap; }
+  .reset .wat { font-size: calc(7 * var(--u)); color: var(--gedimd); }
+  .reset .tijd { font-family: var(--mono); font-size: calc(13 * var(--u)); font-weight: 600; }
+  .meter.warn .getal { color: var(--warn); }
+  .meter.warn .vulling { background: var(--warn); }
+  .meter.crit .getal { color: var(--crit); }
+  .meter.crit .vulling { background: var(--crit); }
+  .voet {
+    display: flex; justify-content: space-between; align-items: baseline; gap: calc(4 * var(--u));
+    font-size: calc(6.5 * var(--u)); color: var(--gedimd); white-space: nowrap;
+  }
+  .voet { min-width: 0; }
+  .voet .bron { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .voet .klok { font-family: var(--mono); }
+  .voet.let-op .bron { color: var(--warn); font-weight: 700; }
+  /* Oude of ontbrekende cijfers: alles gedimd, zodat je op 3 m al ziet dat
+     het niet vers is. De voetregel zegt waarom. */
+  main.oud .getal, main.oud .tijd { color: var(--gedimd); }
+  main.oud .vulling { background: var(--gedimd); }
+  @media (prefers-reduced-motion: reduce) { .vulling { transition: none; } }
+</style>
+</head>
+<body>
+<main id="scherm">
+  <div class="meters">
+    <section class="meter" id="m-sessie" aria-labelledby="l-sessie">
+      <div class="label" id="l-sessie">Sessie</div>
+      <div class="getal"><span class="waarde">--</span><span class="pct">%</span></div>
+      <div class="balk" aria-hidden="true"><div class="vulling"></div></div>
+      <div class="reset"><span class="wat">reset</span><span class="tijd">—</span></div>
+    </section>
+    <section class="meter" id="m-week" aria-labelledby="l-week">
+      <div class="label" id="l-week">Week</div>
+      <div class="getal"><span class="waarde">--</span><span class="pct">%</span></div>
+      <div class="balk" aria-hidden="true"><div class="vulling"></div></div>
+      <div class="reset"><span class="wat">reset</span><span class="tijd">—</span></div>
+    </section>
+  </div>
+  <div class="voet" id="voet"><span class="bron" id="bron">verbinden…</span><span class="klok" id="klok">--:--</span></div>
+</main>
+<script>
+(function () {
+  "use strict";
+  // De Pi ververst zelf hoogstens elke 5 minuten; vaker vragen kost niets,
+  // want de verbruikserver antwoordt uit zijn cache.
+  var POLL_MS = 30000;
+  var TIK_MS = 10000;
+
+  var laatst = null;     // laatste antwoord van /verbruik
+  var ontvangen = 0;     // Date.now() op het moment van dat antwoord
+  var fout = null;       // tekst als het ophalen mislukte
+
+  // Tekst in de voetregel per `bron` (zie de verbruikserver). Kort gehouden:
+  // naast de klok passen er op 1024 px zo'n 40 tekens.
+  var BRON = {
+    nep: "NEP-CIJFERS · testserver",
+    gemeten: "NIET LIVE · cijfers",
+    geweigerd: "TOKEN GEWEIGERD · log in op de Pi",
+    "geen-token": "GEEN TOKEN op de Pi",
+    "geen-data": "NOG GEEN CIJFERS"
+  };
+
+  function $(id) { return document.getElementById(id); }
+  function twee(n) { return (n < 10 ? "0" : "") + n; }
+  function klok(d) { return twee(d.getHours()) + ":" + twee(d.getMinutes()); }
+
+  // Resterende tijd, kort genoeg voor 3 m: 3d 04u, 2u14, 45m, <1m.
+  function duur(s) {
+    if (s == null || !isFinite(s)) return "—";
+    s = Math.max(0, Math.round(s));
+    if (s >= 86400) return Math.floor(s / 86400) + "d " + twee(Math.floor(s % 86400 / 3600)) + "u";
+    if (s >= 3600) return Math.floor(s / 3600) + "u" + twee(Math.floor(s % 3600 / 60));
+    if (s >= 60) return Math.floor(s / 60) + "m";
+    return s > 0 ? "<1m" : "nu";
+  }
+
+  function niveau(p) { return p >= 95 ? "crit" : p >= 80 ? "warn" : "ok"; }
+
+  function zetMeter(id, pct, resetS) {
+    var m = $(id);
+    var heeft = typeof pct === "number" && isFinite(pct);
+    m.className = "meter" + (heeft ? " " + niveau(pct) : "");
+    m.querySelector(".waarde").textContent = heeft ? String(Math.round(pct)) : "--";
+    m.querySelector(".vulling").style.width = (heeft ? Math.min(Math.max(pct, 0), 100) : 0) + "%";
+    m.querySelector(".tijd").textContent = duur(resetS);
+  }
+
+  function render() {
+    var nu = Date.now();
+    $("klok").textContent = klok(new Date(nu));
+
+    // De resettijden zijn seconden-vanaf-het-antwoord; lokaal verder aftellen.
+    var verstreken = laatst ? (nu - ontvangen) / 1000 : 0;
+    function rest(v) { return v == null ? null : v - verstreken; }
+    zetMeter("m-sessie", laatst && laatst.five_hour, laatst && rest(laatst.fh_reset_in_s));
+    zetMeter("m-week", laatst && laatst.seven_day, laatst && rest(laatst.sd_reset_in_s));
+
+    var bron = laatst ? laatst.bron : null;
+    var wanneer = laatst && laatst.ts ? klok(new Date(laatst.ts * 1000)) : null;
+    var tekst, letOp = true;
+    if (fout) {
+      tekst = "PI ONBEREIKBAAR" + (wanneer ? " · cijfers van " + wanneer : "");
+    } else if (!laatst) {
+      tekst = "verbinden…"; letOp = false;
+    } else if (bron === "live") {
+      tekst = "live · bijgewerkt " + wanneer; letOp = false;
+    } else {
+      tekst = BRON[bron] || ("bron: " + bron);
+      if (bron === "gemeten" && wanneer) tekst += " van " + wanneer;
+      letOp = bron !== "nep";
+    }
+    $("bron").textContent = tekst;
+    $("voet").className = "voet" + (letOp ? " let-op" : "");
+    // Alles gedimd zodra de cijfers niet vers zijn: dat zie je op 3 m al.
+    $("scherm").className = (fout || (bron && bron !== "live" && bron !== "nep")) ? "oud" : "";
+  }
+
+  function haal() {
+    var ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    var wacht = setTimeout(function () { if (ctrl) ctrl.abort(); }, 8000);
+    fetch("/verbruik", { cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
+      .then(function (r) { if (!r.ok) throw new Error("http " + r.status); return r.json(); })
+      .then(function (d) { laatst = d; ontvangen = Date.now(); fout = null; })
+      .catch(function (e) { fout = String((e && e.message) || e); })
+      .then(function () { clearTimeout(wacht); render(); });
+  }
+
+  render();
+  haal();
+  setInterval(haal, POLL_MS);
+  setInterval(render, TIK_MS);
+})();
+</script>
+</body>
+</html>

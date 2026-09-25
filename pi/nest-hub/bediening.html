@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nest Hub-bediening</title>
+<style>
+  /* Bediening voor telefoon of laptop. Donker, WCAG 2.1 AA: tekst >= 4,5:1,
+     knoppen >= 44 px hoog, zichtbare focus, statusmeldingen via role=status. */
+  :root {
+    --bg: #0b0e12;
+    --paneel: #131a22;
+    --rand: #2a3644;
+    --tekst: #e8edf2;
+    --gedimd: #a3adb8;
+    --accent: #5fbfa3;
+    --op-accent: #0b0e12;
+    --warn: #e6a94f;
+    --focus: #ffd479;
+    --mono: ui-monospace, "Cascadia Mono", "Roboto Mono", Consolas, monospace;
+    --sans: system-ui, "Segoe UI", Roboto, sans-serif;
+  }
+  html, body { margin: 0; background: var(--bg); color: var(--tekst); font-family: var(--sans); line-height: 1.45; }
+  main { max-width: 34rem; margin: 0 auto; padding: 1.25rem 1rem 2.5rem; }
+  h1 { font-size: 1.35rem; margin: 0 0 .25rem; }
+  h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; color: var(--gedimd); font-weight: 600; }
+  .sub { margin: 0; color: var(--gedimd); }
+  .knoppen { display: grid; gap: .75rem; margin: 1.25rem 0 .5rem; }
+  button {
+    font: inherit; font-size: 1.15rem; font-weight: 600; min-height: 3.5rem;
+    padding: .5rem 1rem; border-radius: .6rem; border: 2px solid var(--rand); cursor: pointer;
+  }
+  .primair { background: var(--accent); border-color: var(--accent); color: var(--op-accent); }
+  .secundair { background: transparent; border-color: var(--gedimd); color: var(--tekst); }
+  button:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+  button[disabled] { opacity: .65; cursor: progress; }
+  .melding { min-height: 1.5em; margin: .25rem 0 0; color: var(--gedimd); }
+  .droog { display: none; margin: 1rem 0 0; padding: .6rem .8rem; border: 1px solid var(--warn); border-radius: .5rem; color: var(--warn); }
+  .droog.aan { display: block; }
+  .paneel { background: var(--paneel); border: 1px solid var(--rand); border-radius: .6rem; padding: 1rem; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .5rem 1rem; margin: 0; }
+  dt { color: var(--gedimd); }
+  dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  .klein { display: block; font-family: var(--sans); font-size: .85rem; color: var(--gedimd); }
+  ol { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: .9rem; }
+  li { padding: .35rem 0; border-top: 1px solid var(--rand); overflow-wrap: anywhere; }
+  li:first-child { border-top: 0; }
+  li .wanneer { color: var(--gedimd); margin-right: .5rem; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Nest Hub</h1>
+  <p class="sub">Claude-verbruik op het scherm in de woonkamer.</p>
+
+  <div class="knoppen">
+    <button type="button" class="primair" id="toon">Toon op de Hub</button>
+    <button type="button" class="secundair" id="fotolijst">Terug naar fotolijst</button>
+  </div>
+  <p class="melding" id="melding" role="status" aria-live="polite"></p>
+  <p class="droog" id="droog">Droog-modus: de bewaker beslist en logt, maar cast niets.</p>
+
+  <h2>Nu</h2>
+  <div class="paneel">
+    <dl>
+      <dt>Scherm</dt><dd id="s-scherm">—</dd>
+      <dt>Modus</dt><dd id="s-modus">—</dd>
+      <dt>Blijft tot</dt><dd id="s-tot">—</dd>
+      <dt>Thuis</dt><dd id="s-thuis">—</dd>
+      <dt>Hub</dt><dd id="s-hub">—</dd>
+      <dt>Verbruik</dt><dd id="s-verbruik">—</dd>
+    </dl>
+  </div>
+
+  <h2>Laatste gebeurtenissen</h2>
+  <div class="paneel"><ol id="geschiedenis"><li>—</li></ol></div>
+
+  <p><a href="/scherm" target="_blank" rel="noopener">Bekijk het scherm zoals de Hub het toont</a></p>
+</main>
+<script>
+(function () {
+  "use strict";
+  // Zonder deze header weigert de bewaker een opdracht; zie do_POST.
+  var KOP = { "X-Nest-Hub": "1" };
+  var HUB = {
+    fotolijst: "toont de fotolijst",
+    eigen: "toont het verbruik",
+    onbereikbaar: "onbereikbaar",
+    onbekend: "nog niet gecontroleerd"
+  };
+
+  function $(id) { return document.getElementById(id); }
+  function twee(n) { return (n < 10 ? "0" : "") + n; }
+  function klok(d) { return twee(d.getHours()) + ":" + twee(d.getMinutes()); }
+  function geleden(s) {
+    if (s == null) return "—";
+    if (s < 60) return "net";
+    if (s < 3600) return Math.round(s / 60) + " min geleden";
+    return Math.floor(s / 3600) + " u " + twee(Math.floor(s % 3600 / 60)) + " geleden";
+  }
+  // Tekst plus een kleinere uitlegregel eronder; alles via textContent.
+  function metUitleg(el, tekst, uitleg) {
+    el.textContent = tekst;
+    if (uitleg) {
+      var s = document.createElement("span");
+      s.className = "klein";
+      s.textContent = uitleg;
+      el.appendChild(s);
+    }
+  }
+
+  function toon(s) {
+    $("s-scherm").textContent = s.scherm_gewenst ? "hoort op de Hub" : "fotolijst";
+    $("s-modus").textContent = s.modus;
+    $("s-tot").textContent = s.actief_nog_s != null
+      ? klok(new Date(Date.now() + s.actief_nog_s * 1000)) +
+        " (nog " + Math.max(1, Math.round(s.actief_nog_s / 60)) + " min)"
+      : "—";
+    metUitleg($("s-thuis"), s.thuis === true ? "ja" : s.thuis === false ? "nee" : "onbekend", s.thuis_reden);
+    $("s-hub").textContent = HUB[s.hub] || ("bezig met " + (s.hub_app || "een andere app"));
+    metUitleg($("s-verbruik"),
+      s.laatste_stijging_s != null ? "laatst gestegen " + geleden(s.laatste_stijging_s) : "nog geen stijging gezien",
+      s.verbruik_fout);
+    $("droog").className = "droog" + (s.droog ? " aan" : "");
+
+    var ol = $("geschiedenis");
+    ol.textContent = "";
+    var regels = s.geschiedenis && s.geschiedenis.length ? s.geschiedenis : [[null, "nog niets"]];
+    regels.forEach(function (r) {
+      var li = document.createElement("li");
+      if (r[0] != null) {
+        var w = document.createElement("span");
+        w.className = "wanneer";
+        w.textContent = geleden(r[0]);
+        li.appendChild(w);
+      }
+      li.appendChild(document.createTextNode(r[1]));
+      ol.appendChild(li);
+    });
+  }
+
+  function haalStatus() {
+    return fetch("/status", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("http " + r.status); return r.json(); })
+      .then(toon)
+      .catch(function (e) { $("melding").textContent = "Geen verbinding met de Pi (" + e.message + ")."; });
+  }
+
+  function opdracht(pad, knop, gelukt) {
+    knop.disabled = true;
+    $("melding").textContent = "Bezig…";
+    fetch(pad, { method: "POST", headers: KOP })
+      .then(function (r) { if (!r.ok) throw new Error("http " + r.status); return r.json(); })
+      .then(function (s) {
+        toon(s);
+        $("melding").textContent = gelukt;
+        // De Hub schakelt in de volgende ronde; daarna de uitslag ophalen.
+        setTimeout(haalStatus, 4000);
+        setTimeout(haalStatus, 12000);
+      })
+      .catch(function (e) { $("melding").textContent = "Mislukt: " + e.message; })
+      .then(function () { knop.disabled = false; });
+  }
+
+  $("toon").addEventListener("click", function () {
+    opdracht("/toon", this, "Verstuurd. De Hub schakelt binnen een paar seconden over.");
+  });
+  $("fotolijst").addEventListener("click", function () {
+    opdracht("/fotolijst", this, "Verstuurd. De Hub gaat terug naar de fotolijst; de automaat wacht tot je sessie voorbij is.");
+  });
+
+  haalStatus();
+  setInterval(haalStatus, 10000);
+})();
+</script>
+</body>
+</html>

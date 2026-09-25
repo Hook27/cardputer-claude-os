@@ -1,0 +1,32 @@
+[Unit]
+# Zet het Claude-verbruik op de Nest Hub zolang je thuis met Claude bezig bent,
+# en haalt het weer weg als het stil wordt. Leunt op claude-verbruik.service
+# voor de cijfers, maar degradeert netjes als die er even niet is: dan ziet de
+# bewaker geen stijging en blijft hij van de Hub af.
+Description=Nest Hub-bewaker voor het Claude-verbruik
+Documentation=https://github.com/Hook27/cardputer-claude-os
+After=claude-verbruik.service
+# Een fout die bij elke start terugkomt (zoals een bezette poort, 2026-09-25)
+# niet eindeloos herhalen: na 5 mislukte starts binnen 5 minuten geeft systemd
+# het op, en `systemctl --user status` laat zien waarom.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Hub-adres, Hub-naam en thuis-apparaat staan in een eigen bestand buiten git;
+# zie nest-hub.env.voorbeeld. ${...} levert precies één argument op, ook als de
+# waarde spaties bevat of leeg is. POORT staat hier als standaard; een POORT in
+# het bestand gaat daarvoor.
+Environment=POORT=8092
+EnvironmentFile=%h/nest-hub/nest-hub.env
+ExecStart=%h/nest-hub/venv/bin/python %h/nest-hub/nest_hub_bewaker.py --poort ${POORT} --hub ${HUB} --hub-naam ${HUB_NAAM} --thuis-apparaat ${THUIS_APPARAAT}
+# De bewaker houdt geen toestand bij die een herstart niet overleeft: na een
+# herstart meet hij opnieuw en haalt hij zo nodig een achtergebleven scherm weg.
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
