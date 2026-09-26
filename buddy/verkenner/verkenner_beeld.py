@@ -94,8 +94,8 @@ def _teken(soort, bron_img, w, h, orient=1, melding=None):
     _LCD.fillScreen(ui.ZWART)
     if melding:
         ui.font_prop()
-        _LCD.setTextColor(ui.GRIJS, ui.ZWART)
-        _LCD.drawString(melding, (ui.W - _LCD.textWidth(melding)) // 2, ui.H // 2 - 5)
+        ui.tekst(melding, (ui.W - _LCD.textWidth(melding)) // 2,
+                 (ui.H - ui.FONT_H) // 2, ui.GRIJS)
     bw, bh = (ui.H, ui.W) if stap in (1, 3) else (ui.W, ui.H)
     s, x, y, dw, dh = passend(w, h, bw, bh)
     try:
@@ -147,34 +147,35 @@ def _laad_buffer(f, pos, n, soi=False):
 
 
 def _balk(naam, rechts, mini):
-    """Info-overlay onderaan: naam links, positie rechts, 'MINI'-label."""
-    y = ui.H - 12
-    _LCD.fillRect(0, y, ui.W, 12, ui.DONKER)
-    ui.font_mono()
-    _LCD.setTextColor(ui.GRIJS, ui.DONKER)
-    rw = len(rechts) * ui.MONO_W
-    _LCD.drawString(rechts, ui.W - rw - 3, y + 2)
+    """Info-overlay onderaan (één regel): naam links, positie rechts, en
+    een 'MINI'-label rechtsboven als het de EXIF-miniatuur is."""
+    h = ui.REGEL_H
+    y = ui.H - h
     ui.font_prop()
-    _LCD.setTextColor(ui.CREME, ui.DONKER)
-    _LCD.drawString(ui.passend(ui.ascii(naam), ui.W - rw - 10), 3, y + 1)
+    _LCD.fillRect(0, y, ui.W, h, ui.DONKER)
+    rw = _LCD.textWidth(rechts) if rechts else 0
+    if rechts:
+        ui.tekst(rechts, ui.W - rw - 3, y + 1, ui.GRIJS)
+    ui.tekst(ui.passend(ui.ascii(naam), ui.W - rw - 12), 3, y + 1, ui.CREME)
     if mini:
-        ui.font_mono()
-        _LCD.fillRect(ui.W - 30, 0, 30, 11, ui.DONKER)
-        _LCD.setTextColor(ui.ORANJE, ui.DONKER)
-        _LCD.drawString("MINI", ui.W - 27, 2)
+        mw = _LCD.textWidth("MINI") + 8
+        _LCD.fillRect(ui.W - mw, 0, mw, h, ui.DONKER)
+        ui.tekst("MINI", ui.W - mw + 4, 1, ui.ORANJE)
 
 
 def _bericht(naam, regels):
+    """Tekstscherm in de viewer (fout, of het kaartje voor een foto zonder
+    miniatuur): naam bovenaan, regels van 16 px eronder."""
     _LCD.fillScreen(ui.ZWART)
     ui.font_prop()
-    _LCD.setTextColor(ui.CREME, ui.ZWART)
-    _LCD.drawString(ui.passend(ui.ascii(naam), ui.W - 10), 5, 8)
-    _LCD.fillRect(0, 22, ui.W, 1, ui.ORANJE)
-    y = 34
+    ui.tekst(ui.passend(ui.ascii(naam), ui.W - 10), 5, 2, ui.CREME)
+    _LCD.fillRect(0, ui.REGEL_H + 2, ui.W, 1, ui.ORANJE)
+    y = ui.REGEL_H + 6
     for i, r in enumerate(regels):
-        _LCD.setTextColor(ui.GEEL if i == 0 else ui.GRIJS, ui.ZWART)
-        _LCD.drawString(ui.passend(ui.ascii(r), ui.W - 10), 5, y)
-        y += 13
+        if y + ui.FONT_H > ui.H:
+            break
+        ui.tekst(ui.passend(ui.ascii(r), ui.W - 10), 5, y, ui.GEEL if i == 0 else ui.GRIJS)
+        y += ui.REGEL_H
 
 
 def toon_een(src, map_, e, volledig=False):
@@ -382,6 +383,8 @@ def toon(kb, src, m, i):
                 # en in het RAM past het niet: miniatuur laten staan.
                 _balk("volle resolutie kan hier niet", "", False)
                 continue
+            elif t == "i" and not ok:
+                continue                # geen balk op een tekstscherm
             elif t == "i":
                 balk = not balk
                 break

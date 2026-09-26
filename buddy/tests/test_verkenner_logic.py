@@ -139,6 +139,7 @@ class NepLcd:
 
     def __init__(self):
         self.font = "DejaVu9"
+        self.kleuren = (0, 0)
         self.teksten = []
         self.tekeningen = []
         self.via_venster = []
@@ -151,8 +152,11 @@ class NepLcd:
     def textWidth(self, s):
         return len(s) * (6 if self.font == "ASCII7" else 5)
 
+    def setTextColor(self, fg, bg=0):
+        self.kleuren = (fg, bg)
+
     def drawString(self, s, x, y):
-        self.teksten.append((s, x, y))
+        self.teksten.append((s, x, y, self.kleuren))
 
     def getRotation(self):
         return self.rotatie
@@ -974,15 +978,38 @@ def test_png_bmp_gif_headers():
 # ---- tests: tekst en hex -------------------------------------------------------
 
 
+_VAST6 = bytearray([6] * 128)       # 6 px per teken: 39 tekens op 234 px
+
+
+def _dejavu9_maten():
+    """Breedtes zoals gemeten op het toestel (DejaVu9), de rest 7 px."""
+    m = bytearray([7] * 128)
+    for c, w in (("i", 3), ("l", 3), ("1", 4), ("W", 14), ("m", 11), (" ", 3),
+                 ("A", 10), ("D", 10), (".", 3), ("0", 8)):
+        m[ord(c)] = w
+    return m
+
+
 def test_breek_regels():
     import verkenner_tekst as vt
-    assert vt.breek(b"hallo\nwereld", 10) == [(0, "hallo"), (6, "wereld")]
-    assert vt.breek(b"a" * 80, 10) == [(0, "a" * 39), (39, "a" * 39), (78, "aa")]
-    assert vt.breek(b"\tx", 5) == [(0, "    x")]
-    assert vt.breek(b"ab\r\ncd", 5) == [(0, "ab"), (4, "cd")]
-    assert vt.breek("é日".encode(), 5) == [(0, "e?")]
-    assert vt.breek(b"\xff\x01z", 5) == [(0, "?.z")]
-    assert vt.breek(b"a" * 39 + b"\nb", 5) == [(0, "a" * 39), (40, "b")], "geen lege regel na precies vol"
+    m = _VAST6
+    assert vt.breek(b"hallo\nwereld", 10, m, 234) == [(0, "hallo"), (6, "wereld")]
+    assert vt.breek(b"a" * 80, 10, m, 234) == [(0, "a" * 39), (39, "a" * 39), (78, "aa")]
+    assert vt.breek(b"\tx", 5, m, 234) == [(0, "    x")]
+    assert vt.breek(b"ab\r\ncd", 5, m, 234) == [(0, "ab"), (4, "cd")]
+    assert vt.breek("é日".encode(), 5, m, 234) == [(0, "e?")]
+    assert vt.breek(b"\xff\x01z", 5, m, 234) == [(0, "?.z")]
+    assert vt.breek(b"a" * 39 + b"\nb", 5, m, 234) == [(0, "a" * 39), (40, "b")], "geen lege regel na precies vol"
+
+
+def test_breek_op_pixelbreedte():
+    import verkenner_tekst as vt
+    m = _dejavu9_maten()
+    # 'W' is 14 px, 'i' 3 px: op 42 px passen 3 W's of 14 i's.
+    assert vt.breek(b"WWWWW", 5, m, 42) == [(0, "WWW"), (3, "WW")]
+    assert vt.breek(b"i" * 20, 5, m, 42) == [(0, "i" * 14), (14, "i" * 6)]
+    for regel in vt.breek(b"Wim mailt 1000 Doos. " * 20, 50, m, 236):
+        assert sum(m[ord(c)] for c in regel[1]) <= 236, regel
 
 
 def test_terugbladeren_is_spiegel_van_vooruit():
@@ -994,21 +1021,22 @@ def test_terugbladeren_is_spiegel_van_vooruit():
             stukken.append(b"")
     data = b"\n".join(stukken) + b"\n\ttab\n" + "slot met ümlaut".encode()
     f = io.BytesIO(data)
+    m = _dejavu9_maten()
     tops = [0]
     while True:
-        regels = vt.breek(data[tops[-1]:tops[-1] + 2048], 2)
+        regels = vt.breek(data[tops[-1]:tops[-1] + 2048], 2, m, 236)
         if len(regels) < 2:
             break
         tops.append(tops[-1] + regels[1][0])
     terug = [tops[-1]]
     while terug[-1] > 0:
-        terug.append(vt.vorige_regel(f, terug[-1]))
+        terug.append(vt.vorige_regel(f, terug[-1], m, 236))
     assert list(reversed(terug)) == tops
 
 
 def test_hex_regel():
     import verkenner_tekst as vt
-    assert vt.hex_regel(0x123456789, b"\x00AB\xff") == ("456789", "00 41 42 FF", ".AB.")
+    assert vt.hex_regel(0x123456789, b"\x00AB\xff") == ("6789", ["00", "41", "42", "FF"], ".AB.")
 
 
 def test_handtekeningen():
@@ -1038,6 +1066,8 @@ def test_ui_opmaak():
     assert ui.grootte_kort(3 * 1024 * 1024) == "3.0M"
     assert ui.grootte_kort(64054362112) == "60G"
     assert ui.grootte_lang(3145728) == "3.145.728 bytes (3,0 MB)"
+    assert ui.grootte_mens(64054362112) == "59,7 GB" and ui.grootte_mens(512) == "512 bytes"
+    assert ui.duizendtallen(488440) == "488.440"
     assert ui.ascii("Jörg-ß 日") == "Jorg-ss ?"
     assert len(ui._VAN) == len(ui._NAAR)
     assert ui.ascii("àÉïõÜçÑæ") == "aEioUcNa"
@@ -1079,6 +1109,22 @@ def _draai_app(toetsen, kaart=None):
 
 
 ENTER, DEL, ESC = 0x0A, 0x08, 0x1B
+
+
+def test_tekst_altijd_doorzichtig_en_regels_ruim_genoeg():
+    """Op het toestel wiste het achtergrondvakje van een 'j' de 'i' ervoor
+    ("vrij" werd "vr j"), en rijen van 12 px sneden de staarten van g/j/p/y
+    af (DejaVu9 is 15 px hoog). Elke drawString moet dus doorzichtig zijn
+    (voorgrond == achtergrond), en de lijstrijen minstens 16 px hoog."""
+    import verkenner_ui as ui
+    lcd, _b = _draai_app([None, ENTER, ENTER, ".", "i", "q", "h", "q",
+                          ",", DEL, "i", "q", "q"])
+    assert lcd.teksten
+    for s, x, y, (fg, bg) in lcd.teksten:
+        assert fg == bg, "tekst met achtergrondvakje: {!r} op ({}, {})".format(s, x, y)
+    assert ui.REGEL_H >= ui.FONT_H + 1
+    app = _laad_app()
+    assert app._RIJ_H == ui.REGEL_H and app._RIJEN * app._RIJ_H <= ui.INHOUD_H
 
 
 def test_wifi_uit_tijdens_sessie_en_daarna_terug():

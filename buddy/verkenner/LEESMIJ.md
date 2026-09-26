@@ -116,6 +116,13 @@ De belangrijkste lessen, allemaal gemeten op het toestel (september 2026):
   16–24 sectoren vooruit lezen gaat dat ~5× sneller dan sector voor sector.
 - **Lumia-miniaturen**: de Lumia laat bij de EXIF-miniatuur de SOI-marker
   (`FF D8`) weg; de viewer zet die er zelf voor.
+- **Leesbaarheid**: DejaVu9 is 15 px hoog en proportioneel; het
+  "ASCII7"-font meet op deze firmware precies hetzelfde, dus een klein
+  monospace-font bestaat niet. Alle regels staan 16 px uit elkaar, en de
+  hexviewer zet elke byte in een vaste cel. De firmware tekent tekst altijd
+  met een achtergrondvakje; daardoor wiste een `j` de `i` ervoor. Alle tekst
+  loopt daarom via `ui.tekst()`, die met gelijke voor- en achtergrondkleur
+  doorzichtig tekent.
 - **Geheugen**: ~62 KB vrij. De modules zijn voorgecompileerd, viewers
   worden na gebruik uit het geheugen gehaald, en grote buffers komen uit
   één vaste werkbuffer van 12 KB (na wat bladeren is er vaak geen groot blok

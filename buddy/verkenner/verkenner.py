@@ -77,11 +77,11 @@ _LCD = ui.LCD
 
 _K = 32                       # onthoud elke 32e map/bestandspositie
 _VENSTER = 24                 # items in het geheugen rond de cursor
-_RIJ_H = 12
+_RIJ_H = ui.REGEL_H           # 16 px: DejaVu9 is 15 px hoog, staarten incluis
 _RIJEN = ui.INHOUD_H // _RIJ_H
 _Y0 = ui.INHOUD_Y
-_X_LABEL = 3
-_X_NAAM = 25
+_X_ICOON = 4
+_X_NAAM = 19
 _LIJST_W = ui.W - 4           # rechts 2 px ruimte + 2 px scrollbalk
 
 _BRON_HINT = "enter open   i info   r kaart   q uit"
@@ -179,44 +179,60 @@ class Map:
 
 
 def _type(e):
-    """-> (label van 3 tekens, kleur, wat Enter doet)."""
+    """-> (icoon, kleur, wat Enter doet)."""
     if e[2] & bron.V_MAP:
-        return "DIR", ui.ORANJE, "map"
+        return "map", ui.ORANJE, "map"
     ext = ui.extensie(e[1])
-    label = ext[:3].upper() if ext else "---"
     if ext in ui.TOONBAAR:
-        return label, ui.BEELDKLEUR, "beeld"
+        return "beeld", ui.BEELDKLEUR, "beeld"
     if ext in ui.BEELD_EXT:
-        return label, ui.BEELDKLEUR, "info"
+        return "beeld", ui.BEELDKLEUR, "info"
     if ext in ui.VIDEO_EXT:
-        return label, ui.VIDEOKLEUR, "info"
+        return "video", ui.VIDEOKLEUR, "info"
     if ext in ui.TEKST_EXT:
-        return label, ui.CREME, "tekst"
-    return label, ui.GRIJS, "hex"
+        return "tekst", ui.CREME, "tekst"
+    return "overig", ui.GRIJS, "hex"
+
+
+def _icoon(soort, x, y, c):
+    """Icoontje van 10×9 px. Leesbaarder dan een typelabel in tekst, en de
+    extensie staat toch al in de naam."""
+    if soort == "map":
+        _LCD.fillRect(x, y, 4, 2, c)
+        _LCD.fillRect(x, y + 2, 10, 7, c)
+    elif soort == "beeld":
+        _LCD.drawRect(x, y, 10, 9, c)
+        _LCD.fillTriangle(x + 1, y + 7, x + 4, y + 3, x + 7, y + 7, c)
+        _LCD.fillRect(x + 6, y + 2, 2, 2, c)
+    elif soort == "video":
+        _LCD.drawRect(x, y, 10, 9, c)
+        _LCD.fillTriangle(x + 3, y + 2, x + 3, y + 6, x + 7, y + 4, c)
+    elif soort == "tekst":
+        _LCD.fillRect(x, y + 1, 9, 1, c)
+        _LCD.fillRect(x, y + 4, 9, 1, c)
+        _LCD.fillRect(x, y + 7, 6, 1, c)
+    else:
+        _LCD.drawRect(x + 1, y, 8, 9, c)
 
 
 def _teken_rij(m, i, top, cursor):
     y = _Y0 + (i - top) * _RIJ_H
     sel = i == cursor
-    bg = ui.ORANJE if sel else ui.ZWART
-    _LCD.fillRect(0, y, _LIJST_W, _RIJ_H, bg)
+    _LCD.fillRect(0, y, _LIJST_W, _RIJ_H, ui.ORANJE if sel else ui.ZWART)
     e = m.item(i)
     if e is None:
         return
-    label, kleur, _wat = _type(e)
-    ui.font_mono()
-    _LCD.setTextColor(ui.ZWART if sel else kleur, bg)
-    _LCD.drawString(label, _X_LABEL, y + 2)
-    rechts = "" if e[2] & bron.V_MAP else ui.grootte_kort(e[3])
-    rw = len(rechts) * ui.MONO_W
-    if rechts:
-        _LCD.setTextColor(ui.ZWART if sel else ui.GRIJS, bg)
-        _LCD.drawString(rechts, _LIJST_W - 3 - rw, y + 2)
+    soort, kleur, _wat = _type(e)
+    _icoon(soort, _X_ICOON, y + 3, ui.ZWART if sel else kleur)
     ui.font_prop()
+    rechts = "" if e[2] & bron.V_MAP else ui.grootte_kort(e[3])
+    rw = _LCD.textWidth(rechts) if rechts else 0
+    if rechts:
+        ui.tekst(rechts, _LIJST_W - 3 - rw, y + 1, ui.ZWART if sel else ui.GRIJS)
     dim = e[2] & (bron.V_VERBORGEN | bron.V_SYSTEEM)
-    _LCD.setTextColor(ui.ZWART if sel else (ui.GRIJS if dim else ui.CREME), bg)
-    ruimte = _LIJST_W - 3 - rw - 5 - _X_NAAM
-    _LCD.drawString(ui.passend(ui.ascii(e[1]), ruimte), _X_NAAM, y + 1)
+    kleur = ui.ZWART if sel else (ui.GRIJS if dim else ui.CREME)
+    ruimte = _LIJST_W - 3 - rw - 6 - _X_NAAM
+    ui.tekst(ui.passend(ui.ascii(e[1]), ruimte), _X_NAAM, y + 1, kleur)
 
 
 def _teken_balk(n, top):
@@ -441,50 +457,43 @@ def _bron_items(kaart):
 
 
 def _teken_bronnen(items, keuze):
+    """Startscherm: per bron een titel en een detailregel, 32 px per bron
+    (twee regels van 16 px), zodat ook hier geen staarten wegvallen."""
     ui.kop("Verkenner", "alleen lezen", ui.GROEN)
     ui.wis_inhoud()
+    ui.font_prop()
     for i, (titel, detail, kleur, _s) in enumerate(items):
-        y = _Y0 + 4 + i * 30
+        y = _Y0 + i * 2 * ui.REGEL_H
         sel = i == keuze
         if sel:
-            _LCD.fillRect(0, y - 2, ui.W, 28, ui.ORANJE)
-        bg = ui.ORANJE if sel else ui.ZWART
-        ui.font_prop()
-        _LCD.setTextColor(ui.ZWART if sel else ui.CREME, bg)
-        _LCD.drawString(titel, 8, y)
-        _LCD.setTextColor(ui.ZWART if sel else kleur, bg)
-        _LCD.drawString(ui.passend(ui.ascii(detail), ui.W - 20), 8, y + 12)
+            _LCD.fillRect(0, y, ui.W, 2 * ui.REGEL_H, ui.ORANJE)
+        ui.tekst(titel, 8, y, ui.ZWART if sel else ui.CREME)
+        ui.tekst(ui.passend(ui.ascii(detail), ui.W - 16), 8, y + ui.REGEL_H,
+                 ui.ZWART if sel else kleur)
     ui.hint(_BRON_HINT)
 
 
 def _kaart_info(kb, kaart, src):
-    regels = [("Bestandssysteem", "exFAT" if kaart.soort == "exfat" else "FAT")]
-    regels.append(("Capaciteit", ui.grootte_lang(kaart.grootte)))
+    # Korte labels: de labelkolom is zo breed als het langste label, en
+    # elke px daarvan gaat van de waarden af.
+    regels = [("Systeem", "exFAT" if kaart.soort == "exfat" else "FAT")]
+    regels.append(("Grootte", ui.grootte_mens(kaart.grootte)))
+    regels.append(("Bytes", ui.duizendtallen(kaart.grootte)))
     if kaart.start:
-        regels.append(("Partitie start", "sector {}".format(kaart.start)))
+        regels.append(("Partitie", "vanaf sector {}".format(kaart.start)))
     if kaart.soort == "exfat":
         fs = src.fs
         regels.append(("Label", kaart.label or "(geen)"))
-        regels.append(("Serienummer", "{:04X}-{:04X}".format(fs.serie >> 16, fs.serie & 0xFFFF)))
-        regels.append(("Cluster", ui.grootte_lang(fs.clus_bytes)))
-        regels.append(("Clusters", str(fs.n_clus)))
+        regels.append(("Serienr.", "{:04X}-{:04X}".format(fs.serie >> 16, fs.serie & 0xFFFF)))
+        regels.append(("Cluster", ui.grootte_mens(fs.clus_bytes)))
+        regels.append(("Clusters", ui.duizendtallen(fs.n_clus)))
         if fs.procent_gebruikt is not None:
             regels.append(("In gebruik", "{}%".format(fs.procent_gebruikt)))
     else:
         v = src.vrij()
         if v:
-            regels.append(("Vrij", ui.grootte_lang(v[0])))
-    ui.kop("SD-kaart")
-    ui.wis_inhoud()
-    ui.font_prop()
-    for j, (label, waarde) in enumerate(regels[:8]):
-        y = ui.INHOUD_Y + 3 + j * 11
-        _LCD.setTextColor(ui.GRIJS, ui.ZWART)
-        _LCD.drawString(label, 4, y)
-        _LCD.setTextColor(ui.CREME, ui.ZWART)
-        _LCD.drawString(ui.passend(ui.ascii(waarde), ui.W - 96), 92, y)
-    ui.hint("druk op een toets")
-    ui.wacht_toets(kb)
+            regels.append(("Vrij", ui.grootte_mens(v[0])))
+    ui.regels_scherm(kb, "SD-kaart", [(l, w, ui.CREME) for l, w in regels])
 
 
 def _wifi_uit():

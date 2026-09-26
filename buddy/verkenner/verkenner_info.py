@@ -12,12 +12,8 @@ tekstviewer (verkenner_tekst); de app regelt dat, zodat deze module en de
 viewer niet tegelijk geladen zijn.
 """
 
-import time
-
 import verkenner_ui as ui
 from verkenner_bron import V_MAP, V_AANEEN, V_VERBORGEN, V_SYSTEEM, V_ALLEEN_LEZEN
-
-_LCD = ui.LCD
 
 TEKST_EXT = ui.TEKST_EXT
 VIDEO_EXT = ui.VIDEO_EXT
@@ -230,33 +226,12 @@ def toon_info(kb, src, map_, e, pad):
     gebruiker vanaf hier naar een viewer wil."""
     ui.bezig("lezen...")
     regels = info_regels(src, map_, e)
-    boven = 0
-    zichtbaar = (ui.INHOUD_H - 4) // 11
-    while True:
-        ui.kop(pad + "/" + e[1])
-        ui.wis_inhoud()
-        for j, (label, waarde, kleur) in enumerate(regels[boven:boven + zichtbaar]):
-            y = ui.INHOUD_Y + 3 + j * 11
-            ui.font_prop()
-            _LCD.setTextColor(ui.GRIJS, ui.ZWART)
-            _LCD.drawString(label, 4, y)
-            _LCD.setTextColor(kleur, ui.ZWART)
-            _LCD.drawString(ui.passend(ui.ascii(str(waarde)), ui.W - 68), 64, y)
-        meer = len(regels) > zichtbaar
-        ui.hint("; . scrol   h hex   t tekst   q terug" if meer else "h hex   t tekst   q terug")
-        while True:
-            t = ui.toets(kb)
-            if t is None:
-                time.sleep_ms(30)
-                continue
-            if t in ("q", "esc", "del", "enter", "i", "links"):
-                return None
-            if t in ("h", "t") and not e[2] & V_MAP:
-                return "hex" if t == "h" else "tekst"
-            if t == "neer" and boven + zichtbaar < len(regels):
-                boven += 1
-            elif t == "op" and boven > 0:
-                boven -= 1
-            else:
-                continue
-            break
+    if e[2] & V_MAP:
+        ui.regels_scherm(kb, pad + "/" + e[1], regels)
+        return None
+    t = ui.regels_scherm(kb, pad + "/" + e[1], regels, ("h", "t"), "h hex  t tekst")
+    if t == "h":
+        return "hex"
+    if t == "t":
+        return "tekst"
+    return None
